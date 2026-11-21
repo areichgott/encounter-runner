@@ -167,6 +167,7 @@ export function actionsAtStart(c, baseActions = 3) {
   const perm = (c.permanent || []).find(p => p.name === "Slowed");
   const slowedVal = Math.max(sl ? (sl.value || 0) : 0, perm ? perm.value : 0);
   let actions = baseActions;
+  if (cond(c, "Quickened")) { actions += 1; notes.push("Quickened: +1 action"); }
   let lostStun = 0;
   if (st && st.value > 0) {
     lostStun = Math.min(st.value, actions);

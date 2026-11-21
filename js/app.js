@@ -2,7 +2,7 @@ import { kv, packs as packStore, clearAll, requestPersist } from "./store.js";
 import { CONDITIONS, COND_BY_NAME, QUICK_CONDITIONS, DAMAGE_TYPES, ALL_TYPES } from "./conditions.js";
 import { rollExpr, rollDamage, d20, degree, mapPenalty, resolveDamage, currentAC, currentHardness, actionsAtStart, cond } from "./rules.js";
 
-export const APP_VERSION = "1.1.0";
+export const APP_VERSION = "1.2.0";
 
 /* ================================================================ state */
 const DEFAULT_PALETTE = [
@@ -277,7 +277,7 @@ function buildSetup(packId, secId, variantId) {
     for (let k = 0; k < sl.count; k++) {
       seen[sl.creature] = (seen[sl.creature] || 0) + 1;
       let color = null, colorName = null;
-      if (cr.kind !== "hazard" && S.settings.colors && pal.length) { const pc = pal[colorRun % pal.length]; color = pc.c; colorName = pc.n; colorRun++; }
+      if (cr.kind !== "hazard" && !cr.ally && S.settings.colors && pal.length) { const pc = pal[colorRun % pal.length]; color = pc.c; colorName = pc.n; colorRun++; }
       const skill = sl.initSkill || (cr.kind === "hazard" ? "Stealth" : "Perception");
       const mod = initModFor(cr, skill) + (sl.initAdj || 0);
       rows.push({
@@ -307,7 +307,7 @@ function setupAdd(creatureId) {
   const st = S.setup; const p = pack(st.packId); const cr = p.creatures[creatureId];
   const like = st.rows.find(r => r.creatureId === creatureId);
   let color = null, colorName = null;
-  if (cr.kind !== "hazard" && S.settings.colors && S.settings.palette.length) {
+  if (cr.kind !== "hazard" && !cr.ally && S.settings.colors && S.settings.palette.length) {
     const used = new Set(st.rows.map(r => r.color));
     const pc = S.settings.palette.find(x => !used.has(x.c)) || S.settings.palette[st.rows.length % S.settings.palette.length];
     color = pc.c; colorName = pc.n;
@@ -330,7 +330,7 @@ function viewSetup() {
   if (!st) return `${topbar("Encounter setup", { back: "#library" })}<main class="page"><div class="empty">Pick an encounter from a pack first.</div></main>`;
   const p = pack(st.packId), s = sectionOf(st.packId, st.secId);
   const v = s.variants.find(x => x.id === st.variantId);
-  const missing = st.rows.filter(r => r.init == null).length + st.pcs.filter(r => r.include && r.init == null).length;
+  const missing = st.rows.filter(r => r.init == null && !p.creatures[r.creatureId].simple).length + st.pcs.filter(r => r.include && r.init == null).length;
   return `${topbar(`Set up: ${esc(s.title)}`, { back: `#section/${encodeURIComponent(st.packId)}/${encodeURIComponent(st.secId)}` })}
   <main class="page setup">
     <div class="row between">
@@ -346,8 +346,8 @@ function viewSetup() {
           <td>${r.kind === "hazard" ? `<span class="chipc hz">HZ</span>` : `<button class="chipc" style="background:${r.color || "transparent"};color:${textOn(r.color)}" data-act="cycleColor" data-uid="${r.uid}" aria-label="Change color">${r.color ? "" : "—"}</button>`}</td>
           <td><b>${esc(rowName(r))}</b>${r.joinsRound ? ` <span class="badge">joins round ${r.joinsRound}</span>` : ""}${r.startConditions.length ? ` <span class="badge">${r.startConditions.map(c => esc(c.name + (c.value ? " " + c.value : ""))).join(", ")}</span>` : ""}</td>
           <td>${esc(r.initSkill)} ${sgn(r.initMod)}${r.initNote ? ` <span class="muted small">(${esc(r.initNote)})</span>` : ""}</td>
-          <td><button data-act="rollInit" data-uid="${r.uid}">🎲</button></td>
-          <td><input type="number" inputmode="numeric" class="initin" value="${r.init ?? ""}" data-in="setInit" data-uid="${r.uid}"></td>
+          ${p.creatures[r.creatureId].simple ? `<td></td><td class="muted small">no turn</td>` : `<td><button data-act="rollInit" data-uid="${r.uid}">🎲</button></td>
+          <td><input type="number" inputmode="numeric" class="initin" value="${r.init ?? ""}" data-in="setInit" data-uid="${r.uid}"></td>`}
           <td><button class="mini x" data-act="setupRemove" data-uid="${r.uid}" aria-label="Remove">×</button></td>
         </tr>`).join("")}</tbody></table>
         <div class="setupsteps">${[...new Set(st.rows.map(r => r.creatureId))].map(id => counterHtml(p.creatures[id].name, st.rows.filter(r => r.creatureId === id).length, null, "setupStep", `data-id="${esc(id)}"`)).join("")}
@@ -376,7 +376,7 @@ function startEncounter() {
       uid: r.uid, kind: r.kind, creatureId: r.creatureId, name: rowName(r), color: r.color, colorName: r.colorName,
       init: r.init ?? 0, hp: cr.hp ?? null, maxHp: cr.hp ?? null, temp: 0, broken: false, defeated: false,
       conditions: r.startConditions.map(c => ({ id: uid(), name: c.name, value: c.value || null })),
-      permanent: cr.permanent || [], joinsRound: r.joinsRound || 0, delayed: false,
+      permanent: cr.permanent || [], joinsRound: r.joinsRound || 0, delayed: false, noTurn: !!cr.simple, ally: !!cr.ally,
       counters: (cr.counters || []).map(c => ({ label: c.label, val: c.start || 0, max: c.max, down: !!c.down })),
       cooldowns: {}, used: {},
     });
@@ -409,7 +409,7 @@ function placeByInit(list, c) {
 
 /* ------------------------------------------------------------- combat */
 function eligible(list) {
-  return list.filter(c => !c.delayed && !(c.joinsRound && S.enc.round < c.joinsRound) && !(S.settings.skipDefeated && c.defeated));
+  return list.filter(c => !c.noTurn && !c.delayed && !(c.joinsRound && S.enc.round < c.joinsRound) && !(S.settings.skipDefeated && c.defeated));
 }
 function startOfTurn(c) {
   const notes = [];
@@ -426,6 +426,15 @@ function startOfTurn(c) {
     }
     c.used = {};
   }
+  if (cr && cr.turnTable && cr.turnTable.options && cr.turnTable.options.length) {
+    c.conditions = (c.conditions || []).filter(x => x.src !== "table");
+    const opt = cr.turnTable.options[Math.floor(Math.random() * cr.turnTable.options.length)];
+    c.tableState = opt.name;
+    let extra = "";
+    if (opt.heal && c.hp != null) { const r = rollExpr(opt.heal); const b = c.hp; c.hp = Math.min(c.maxHp, c.hp + r.total); if (c.hp > 0) c.defeated = false; extra = ` (regains ${r.total}: HP ${b} → ${c.hp})`; }
+    for (const k of opt.conds || []) c.conditions.push({ id: uid(), name: k.name, value: k.value || null, src: "table", untilEnd: !!k.untilEnd });
+    notes.push(`<b>${esc(cr.turnTable.label || "Random state")}: ${esc(opt.name)}</b> — ${fmt(opt.text, { link: false })}${extra}`);
+  }
   const base = c.kind === "hazard" && cr && cr.routine ? cr.routine.actions : 3;
   const a = actionsAtStart(c, base);
   notes.push(...a.notes);
@@ -434,6 +443,13 @@ function startOfTurn(c) {
 }
 function endOfTurn(c) {
   const notes = [];
+  const crx = crOf(c);
+  if (crx && crx.turnTable && c.tableState) {
+    const opt = crx.turnTable.options.find(o => o.name === c.tableState);
+    if (opt && opt.endDamage) { const r = rollExpr(opt.endDamage); notes.push(`<b>${esc(opt.name)}</b>: ${esc(opt.endText || "")} ${esc(opt.endDamage)} = <b>${r.total}</b>`); }
+    const before = c.conditions.length; c.conditions = c.conditions.filter(x => !(x.src === "table" && x.untilEnd));
+    if (c.conditions.length < before) notes.push(`${esc(opt ? opt.name : "State")} effect ends`);
+  }
   const fr = cond(c, "Frightened");
   if (fr && fr.value) { fr.value--; notes.push(fr.value > 0 ? `Frightened drops to ${fr.value}` : "Frightened ends"); if (fr.value <= 0) c.conditions = c.conditions.filter(x => x !== fr); }
   const cr = crOf(c);
@@ -509,7 +525,8 @@ function condChips(c, small = true) {
 }
 function colorDot(c) {
   if (c.kind === "pc") return `<span class="dot pc">PC</span>`;
-  if (c.kind === "hazard") return `<span class="dot hz">HZ</span>`;
+  if (c.kind === "hazard") return `<span class="dot hz">${c.noTurn && crOf(c) && crOf(c).object ? "OBJ" : "HZ"}</span>`;
+  if (c.ally) return `<span class="dot ally">ALLY</span>`;
   return `<span class="dot" style="background:${c.color || "var(--line)"};color:${textOn(c.color)}">${c.color ? "" : esc((c.name || "?")[0])}</span>`;
 }
 function viewCombat() {
@@ -520,13 +537,14 @@ function viewCombat() {
   if (!S.ui.sel || !order.find(c => c.uid === S.ui.sel)) S.ui.sel = enc.active;
   const waiting = order.filter(c => c.joinsRound && enc.round < c.joinsRound);
   const delayed = order.filter(c => c.delayed);
-  const main = order.filter(c => !waiting.includes(c) && !delayed.includes(c));
+  const noturn = order.filter(c => c.noTurn);
+  const main = order.filter(c => !waiting.includes(c) && !delayed.includes(c) && !c.noTurn);
   const row = c => {
     const cr = crOf(c);
     const ac = c.kind === "pc" ? null : currentAC(cr, c);
     return `<li class="crow ${c.uid === enc.active ? "active" : ""} ${c.uid === S.ui.sel ? "sel" : ""} ${c.defeated ? "dead" : ""}" data-act="sel" data-uid="${c.uid}">
       <span class="grip" data-grip="${c.uid}" aria-label="Drag to reorder">⋮⋮</span>
-      <button class="init" data-act="editInit" data-uid="${c.uid}" aria-label="Edit initiative">${c.init}</button>
+      ${c.noTurn ? `<span class="init blank"></span>` : `<button class="init" data-act="editInit" data-uid="${c.uid}" aria-label="Edit initiative">${c.init}</button>`}
       ${colorDot(c)}
       <span class="cname"><b>${esc(c.name)}</b><span class="cconds">${condChips(c)}</span></span>
       <span class="cstats">${c.hp != null ? `<span class="hpn">${c.hp}${c.temp ? `<small>+${c.temp}</small>` : ""}<small>/${c.maxHp}</small></span>${hpBar(c)}` : ""}
@@ -550,6 +568,7 @@ function viewCombat() {
       <section class="pane-left" data-keep-scroll="left">
         <ol class="order" id="mainOrder">${main.map(row).join("")}</ol>
         ${delayed.length ? `<h4 class="subh">Delaying</h4><ol class="order">${delayed.map(c => `<li class="crow delayed" data-act="sel" data-uid="${c.uid}">${colorDot(c)}<span class="cname"><b>${esc(c.name)}</b></span><button class="primary" data-act="undelay" data-uid="${c.uid}">Act now</button></li>`).join("")}</ol>` : ""}
+        ${noturn.length ? `<h4 class="subh">Hazards & objects (no turn)</h4><ol class="order">${noturn.map(c => row(c).replace('<span class="grip"', '<span class="grip hidden"')).join("")}</ol>` : ""}
         ${waiting.length ? `<h4 class="subh">Joining later</h4><ol class="order">${waiting.map(c => `<li class="crow waiting ${c.uid === S.ui.sel ? "sel" : ""}" data-act="sel" data-uid="${c.uid}"><span class="init">${c.init}</span>${colorDot(c)}<span class="cname"><b>${esc(c.name)}</b><span class="muted small">joins round ${c.joinsRound}</span></span><button data-act="joinNow" data-uid="${c.uid}">Join now</button></li>`).join("")}</ol>` : ""}
         <div class="leftfoot"><button data-act="addCombatant">+ Add combatant</button></div>
       </section>
@@ -643,7 +662,7 @@ function damageLine(c, cr, s, crit) {
   const mode = S.settings.critMode;
   const base = rollDamage(s.damage, crit, mode);
   const parts = [{ total: base.total, type: s.type, text: base.text }];
-  for (const x of activeConds(c, cr, s.range || "melee")) { const r = rollDamage(x.dice, crit, mode); parts.push({ total: r.total, type: x.type, text: r.text, label: x.label }); }
+  for (const x of activeConds(c, cr, s.range || "melee")) { const r = rollDamage(x.dice, crit, mode); parts.push({ total: r.total, type: x.type === "same" ? s.type : x.type, text: r.text, label: x.label }); }
   const total = parts.reduce((a, q) => a + q.total, 0);
   const desc = parts.map(q => `${q.total} ${q.type}${q.label ? ` (${q.label})` : ""}`).join(" + ");
   return { total, desc, detail: parts.map(q => q.text).join("; ") };
@@ -680,10 +699,12 @@ function statblock(cr, c) {
     if (cr.routine) h += `<div class="ability"><b>Routine</b> (${cr.routine.actions} actions) ${fmt(cr.routine.text)}
       <button class="rb dmgroll" data-act="rollDmg" data-expr="${esc(cr.routine.damage)}" data-type="${esc(cr.routine.type)}" data-label="${esc(cr.name)} routine">${esc(cr.routine.damage)} ${esc(cr.routine.type)}</button>
       <button class="rb" data-act="areaFromRoutine" data-uid="${c.uid}">Apply to monsters…</button></div>`;
+    if (cr.ac != null || cr.hp != null) h += `<p>${cr.ac != null ? `<b>AC</b> ${currentAC(cr, c)}` : ""}${cr.saves && cr.saves.fort != null ? `; <b>Fort</b> ${rollBtn(`${cr.name}: Fortitude`, cr.saves.fort)}` : ""}${cr.saves && cr.saves.ref != null ? ` <b>Ref</b> ${rollBtn(`${cr.name}: Reflex`, cr.saves.ref)}` : ""}${cr.saves && cr.saves.will != null ? ` <b>Will</b> ${rollBtn(`${cr.name}: Will`, cr.saves.will)}` : ""}${cr.hp != null ? `; <b>HP</b> ${cr.hp}${cr.bt ? ` (BT ${cr.bt})` : ""}` : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.hpNote ? ` <span class="muted">(${fmt(cr.hpNote)})</span>` : ""}</p>`;
     h += ab("top") + ab("mid") + ab("bottom");
     if (cr.reset) h += `<p><b>Reset</b> ${fmt(cr.reset)}</p>`;
     h += `<hr><p><b>Disable</b> ${fmt(cr.disable)}</p><hr>`;
-    h += `<p><b>Stealth</b> ${rollBtn(`${cr.name}: Stealth`, cr.stealth)} ${cr.stealthNote ? fmt("(" + cr.stealthNote + ")") : ""}</p>`;
+    if (cr.stealthDC != null) h += `<p><b>Stealth DC</b> ${cr.stealthDC} ${cr.stealthNote ? fmt("(" + cr.stealthNote + ")") : ""}</p>`;
+    else if (cr.stealth != null) h += `<p><b>Stealth</b> ${rollBtn(`${cr.name}: Stealth`, cr.stealth)} ${cr.stealthNote ? fmt("(" + cr.stealthNote + ")") : ""}</p>`;
     if (cr.description) h += `<p><b>Description</b> ${fmt(cr.description)}</p>`;
   } else {
     h += ab("top");
@@ -692,7 +713,7 @@ function statblock(cr, c) {
       h += `<div class="condtoggles">${cr.conditional.map(x => {
         const on = !!(c.toggles || {})[x.id];
         return `<span class="ctog"><button class="togchip" aria-pressed="${on}" data-act="toggleCond" data-hold="toggleCondAll" data-uid="${c.uid}" data-id="${esc(x.id)}">
-          <span class="tl">${on ? "✓ " : ""}${esc(x.label)}</span><span class="ts">+${esc(x.dice)} ${esc(x.type)} · ${x.applies === "all" ? "all attacks" : x.applies + " attacks"}</span><span class="th">hold = all</span></button>
+          <span class="tl">${on ? "✓ " : ""}${esc(x.label)}</span><span class="ts">+${esc(x.dice)} ${x.type === "same" ? "damage" : esc(x.type)} · ${x.applies === "all" ? "all attacks" : x.applies + " attacks"}</span><span class="th">hold = all</span></button>
           <button class="mini allbtn" data-act="toggleCondAll" data-uid="${c.uid}" data-id="${esc(x.id)}">All ${esc(cr.name)}</button></span>`;
       }).join("")}</div>`;
     }
@@ -703,7 +724,7 @@ function statblock(cr, c) {
       const extras = activeConds(c, cr, s.range);
       h += `<div class="strike"><div><b>${s.range === "melee" ? "Melee" : "Ranged"}</b> ${icon(s.cost || "1")} ${esc(s.name)}
           ${s.traits && s.traits.length ? `<span class="muted">(${s.traits.map(t => esc(t)).join(", ")})</span>` : ""}
-          <span class="dmgtxt">${esc(s.damage)} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${esc(x.type)}</b>`).join("")}${s.extra ? ` ${fmt(s.extra)}` : ""}</span></div>
+          <span class="dmgtxt">${esc(s.damage)} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${x.type === "same" ? "" : esc(x.type)} (${esc(x.label)})</b>`).join("")}${s.extra ? ` ${fmt(s.extra)}` : ""}</span></div>
         <div class="strike-rolls">
           ${[1, 2, 3].map(n => { const m = s.bonus + mapPenalty(n, agile); return `<button class="rb atk" data-act="roll" data-strike="1" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-label="${esc(`${c.name}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
           <button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name)}">Damage</button>
@@ -961,7 +982,7 @@ const A = {
   confirmYes: () => { const m = S.ui.modal; S.ui.modal = null; if (m && m.then) m.then(); else render(); },
   setupVariant: el => { S.setup = buildSetup(S.setup.packId, S.setup.secId, el.dataset.id); render(); },
   rollInit: el => { const r = S.setup.rows.find(x => x.uid === el.dataset.uid); r.init = d20(r.initMod).total; render(); },
-  rollAllInit: () => { for (const r of S.setup.rows) r.init = d20(r.initMod).total; render(); },
+  rollAllInit: () => { const p = pack(S.setup.packId); for (const r of S.setup.rows) if (!p.creatures[r.creatureId].simple) r.init = d20(r.initMod).total; render(); },
   cycleColor: el => {
     const r = S.setup.rows.find(x => x.uid === el.dataset.uid); const pal = S.settings.palette;
     const i = pal.findIndex(p => p.c === r.color); const n = pal[(i + 1) % pal.length]; r.color = n.c; r.colorName = n.n; render();
@@ -1163,7 +1184,9 @@ const I = {
     try {
       const p = JSON.parse(await f.text());
       if (p.format !== "encounter-runner-pack" || !p.id || !Array.isArray(p.sections) || !p.creatures) throw new Error("This isn't an Encounter Runner pack.");
-      await packStore.put(p); S.packs[p.id] = p; toast(`Imported ${esc(p.chapter)}`); render();
+      const newer = (a, b) => { const x = String(a).split(".").map(Number), y = String(b).split(".").map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); } return false; };
+      await packStore.put(p); S.packs[p.id] = p;
+      toast(p.minAppVersion && newer(p.minAppVersion, APP_VERSION) ? `Imported ${esc(p.chapter)}, but it needs app version ${esc(p.minAppVersion)} — reload the app while online to update.` : `Imported ${esc(p.chapter)}`, 6000); render();
     } catch (e) { toast("Import failed: " + esc(e.message), 5000); }
     el.value = "";
   },
@@ -1180,7 +1203,7 @@ const I = {
   setInit: (el, ev) => {
     const st = S.setup; const r = st.rows.find(x => x.uid === el.dataset.uid) || st.pcs.find(x => x.uid === el.dataset.uid);
     r.init = el.value === "" ? null : Number(el.value);
-    const n = st.rows.filter(x => x.init == null).length + st.pcs.filter(x => x.include && x.init == null).length;
+    const n = st.rows.filter(x => x.init == null && !pack(st.packId).creatures[x.creatureId].simple).length + st.pcs.filter(x => x.include && x.init == null).length;
     const mc = document.getElementById("missingCount"); if (mc) mc.textContent = n ? `${n} without initiative (they'll start at 0)` : "";
   },
   pcInclude: el => { const r = S.setup.pcs.find(x => x.uid === el.dataset.uid); r.include = el.checked; },

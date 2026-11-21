@@ -35,7 +35,7 @@ An offline, installable web app (PWA) for running Starfinder 2e / Pathfinder 2e 
 
 ```jsonc
 {
-  "format": "encounter-runner-pack", "version": 1,
+  "format": "encounter-runner-pack", "version": 1, "minAppVersion": "1.2.0",
   "id": "pzo24006e-ch2", "adventure": "…", "chapter": "Chapter 2: …",
   "partyLevel": 2, "lookupsAsOf": "2026-11-21",
   "creatures": { "<id>": Creature },
@@ -45,7 +45,7 @@ An offline, installable web app (PWA) for running Starfinder 2e / Pathfinder 2e 
 }
 ```
 
-**Creature**: `name, kind (creature|hazard), level, rarity, size, traits[], source, sourcePages[], notes[], perception, senses, languages, skills[{name,mod}], attrs{str,dex,con,int,wis,cha}, items, ac, saves{fort,ref,will}, hp, hardness, broken{ac,hardness,when:["half","crit"]}, fastHealing, immunities[], weaknesses[{type,value}], resistances[{type,value}], speed, stealth (hazards), disable, conditional[{id,label,dice,type,applies: melee|ranged|all,when}], abilities[{name, cost, traits, text, place: top|mid|bottom, frequency, cooldown, rollAttack, rollDamage, rollType, refs[]}], strikes[{range: melee|ranged, name, cost, bonus, traits[], damage, type, extra, refs[]}], routine{actions,text,damage,type,save}, reset, refs[]`. Costs: `1 | 2 | 3 | free | reaction`.
+**Creature**: `name, kind (creature|hazard), simple (no turn: simple hazards and objects), object, ally (no mini color), turnTable{label, options[{name,text,heal,conds[{name,value,untilEnd}],endDamage,endText}]} (random state rolled at the start of each turn), stealthDC, bt, hpNote, level, rarity, size, traits[], source, sourcePages[], notes[], perception, senses, languages, skills[{name,mod}], attrs{str,dex,con,int,wis,cha}, items, ac, saves{fort,ref,will}, hp, hardness, broken{ac,hardness,when:["half","crit"]}, fastHealing, immunities[], weaknesses[{type,value}], resistances[{type,value}], speed, stealth (hazards), disable, conditional[{id,label,dice,type,applies: melee|ranged|all,when}], abilities[{name, cost, traits, text, place: top|mid|bottom, frequency, cooldown, rollAttack, rollDamage, rollType, refs[]}], strikes[{range: melee|ranged, name, cost, bonus, traits[], damage, type, extra, refs[]}], routine{actions,text,damage,type,save}, reset, refs[]`. Costs: `1 | 2 | 3 | free | reaction`.
 
 **Section**: `id, title, kind, tag (e.g. "Moderate or Severe 2"), summary, notes[], npcs[], counters[{label,start,max,down}], obstacles[] (chases), events[] (exploration), rewards, treasure, variants[{id,label,p4:[Slot],p5:[Slot],scaling}], tactics{creatureId:text}`.
 
