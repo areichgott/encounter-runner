@@ -28,6 +28,29 @@ export function rollExpr(expr) {
   }
   return { total: Math.max(0, total), text: parts.join(" ").replace(/^\+/, "") };
 }
+/**
+ * Damage roll with crit handling.
+ * mode "double": roll normally, double the total (official rule).
+ * mode "dice": roll twice as many dice and double flat bonuses (house rule).
+ */
+export function rollDamage(expr, crit = false, mode = "double") {
+  if (!crit) return rollExpr(expr);
+  if (mode === "dice") {
+    const s = String(expr || "").replace(/\s+/g, "");
+    const doubled = (s.match(/[+-]?[^+-]+/g) || []).map(t => {
+      const sign = t.startsWith("-") ? "-" : "+";
+      const body = t.replace(/^[+-]/, "");
+      const m = body.match(/^(\d*)d(\d+)$/i);
+      if (m) return `${sign}${parseInt(m[1] || "1", 10) * 2}d${m[2]}`;
+      if (/^\d+$/.test(body)) return `${sign}${parseInt(body, 10) * 2}`;
+      return "";
+    }).join("").replace(/^\+/, "");
+    const r = rollExpr(doubled);
+    return { total: r.total, text: `${doubled}: ${r.text}` };
+  }
+  const r = rollExpr(expr);
+  return { total: r.total * 2, text: `(${r.text}) × 2` };
+}
 export function d20(mod) {
   const nat = rnd(20); return { nat, total: nat + mod, mod };
 }
