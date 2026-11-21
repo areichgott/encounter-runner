@@ -34,7 +34,7 @@ export function rollExpr(expr) {
  * mode "dice": roll twice as many dice and double flat bonuses (house rule).
  */
 export function rollDamage(expr, crit = false, mode = "double") {
-  if (!crit) return rollExpr(expr);
+  if (!crit) { const r = rollExpr(expr); return { total: r.total, text: r.text, expr }; }
   if (mode === "dice") {
     const s = String(expr || "").replace(/\s+/g, "");
     const doubled = (s.match(/[+-]?[^+-]+/g) || []).map(t => {
@@ -46,10 +46,10 @@ export function rollDamage(expr, crit = false, mode = "double") {
       return "";
     }).join("").replace(/^\+/, "");
     const r = rollExpr(doubled);
-    return { total: r.total, text: `${doubled}: ${r.text}` };
+    return { total: r.total, text: r.text, expr: doubled };
   }
   const r = rollExpr(expr);
-  return { total: r.total * 2, text: `(${r.text}) × 2` };
+  return { total: r.total * 2, text: `(${r.text}) × 2`, expr };
 }
 export function d20(mod) {
   const nat = rnd(20); return { nat, total: nat + mod, mod };

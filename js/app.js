@@ -2,7 +2,7 @@ import { kv, packs as packStore, clearAll, requestPersist } from "./store.js";
 import { CONDITIONS, COND_BY_NAME, QUICK_CONDITIONS, DAMAGE_TYPES, ALL_TYPES } from "./conditions.js";
 import { rollExpr, rollDamage, d20, degree, mapPenalty, resolveDamage, currentAC, currentHardness, actionsAtStart, cond } from "./rules.js";
 
-export const APP_VERSION = "1.2.0";
+export const APP_VERSION = "1.2.1";
 
 /* ================================================================ state */
 const DEFAULT_PALETTE = [
@@ -661,11 +661,13 @@ function activeConds(c, cr, range) {
 function damageLine(c, cr, s, crit) {
   const mode = S.settings.critMode;
   const base = rollDamage(s.damage, crit, mode);
-  const parts = [{ total: base.total, type: s.type, text: base.text }];
-  for (const x of activeConds(c, cr, s.range || "melee")) { const r = rollDamage(x.dice, crit, mode); parts.push({ total: r.total, type: x.type === "same" ? s.type : x.type, text: r.text, label: x.label }); }
+  const parts = [{ total: base.total, type: s.type, text: base.text, expr: base.expr }];
+  for (const x of activeConds(c, cr, s.range || "melee")) { const r = rollDamage(x.dice, crit, mode); parts.push({ total: r.total, type: x.type === "same" ? s.type : x.type, text: r.text, expr: r.expr, label: x.label }); }
   const total = parts.reduce((a, q) => a + q.total, 0);
   const desc = parts.map(q => `${q.total} ${q.type}${q.label ? ` (${q.label})` : ""}`).join(" + ");
-  return { total, desc, detail: parts.map(q => q.text).join("; ") };
+  // full working, e.g. "1d8+4: [6] +4 = 10 fire + Show No Mercy 2: 2 = 2 fire"
+  const calc = parts.map(q => `${q.label ? q.label + " " : ""}${q.expr}${/d/i.test(q.expr) || crit ? `: ${q.text}` : ""} = ${q.total} ${q.type}`).join("  +  ");
+  return { total, desc, calc, detail: parts.map(q => q.text).join("; ") };
 }
 function strikeOf(c, el) {
   const cr = crOf(c); if (!cr) return null;
@@ -1004,10 +1006,10 @@ const A = {
       const c = findC(el.dataset.uid); const cr = c && crOf(c); const s = c && strikeOf(c, el);
       if (s && s.damage) {
         const hit = damageLine(c, cr, s, false), crit = damageLine(c, cr, s, true);
-        txt += `<div class="dmgpair"><span>Hit <b>${hit.total}</b> <small>${esc(hit.desc)}</small></span><span>Crit <b>${crit.total}</b> <small>${esc(crit.desc)}</small></span></div>`;
+        txt += `<div class="dmgpair"><div><span>Hit <b>${hit.total}</b></span><small>${esc(hit.calc)}</small></div><div><span>Crit <b>${crit.total}</b>${S.settings.critMode === "dice" ? " <em>dice doubled</em>" : " <em>total × 2</em>"}</span><small>${esc(crit.calc)}</small></div></div>`;
       }
     }
-    showRoll(txt, txt.replace(/<\/span><span>/g, " · ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " "));
+    showRoll(txt, txt.replace(/<\/div><div>/g, " · ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " "));
   },
   rollDmg: el => {
     const crit = !!el.dataset.crit;
@@ -1015,7 +1017,7 @@ const A = {
     if (el.dataset.uid && (el.dataset.si != null || el.dataset.ai != null)) {
       const c = findC(el.dataset.uid); const cr = crOf(c); const s = strikeOf(c, el);
       const d = damageLine(c, cr, s, crit);
-      txt = `${esc(el.dataset.label)}: <b class="rtotal">${d.total}</b> <small>${esc(d.desc)} — ${esc(d.detail)}</small>`;
+      txt = `${esc(el.dataset.label)}: <b class="rtotal">${d.total}</b><div class="dmgcalc">${esc(d.calc)}</div>`;
     } else {
       const r = rollDamage(el.dataset.expr, crit, S.settings.critMode);
       txt = `${esc(el.dataset.label)}: ${esc(r.text)} = <b class="rtotal">${r.total}</b> ${esc(el.dataset.type || "")}`;
