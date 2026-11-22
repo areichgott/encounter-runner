@@ -292,3 +292,10 @@ button.heal{background:var(--heal);border-color:var(--heal);color:#fff;font-weig
 }
 
 .crow .init.blank{background:transparent;border-color:transparent}
+
+/* condition-adjusted values */
+.adjv{color:var(--warn);font-weight:700}
+.basev{font-size:.72em;color:var(--ink2);text-decoration:line-through;margin-left:.25rem;font-weight:400}
+.rb.adj{border-color:var(--warn);color:var(--warn)}
+.condsum{background:var(--warnbg);border:1px solid var(--warn);border-radius:8px;padding:.45rem .7rem;margin-bottom:.5rem}
+.condsum .lbl{color:var(--warn);font-weight:600;margin-right:.3rem}

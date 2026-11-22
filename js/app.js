@@ -1,8 +1,9 @@
 import { kv, packs as packStore, clearAll, requestPersist } from "./store.js";
 import { CONDITIONS, COND_BY_NAME, QUICK_CONDITIONS, DAMAGE_TYPES, ALL_TYPES } from "./conditions.js";
+import { penalty, penaltyText, skillAttr, manualNotes } from "./modifiers.js";
 import { rollExpr, rollDamage, d20, degree, mapPenalty, resolveDamage, currentAC, currentHardness, actionsAtStart, cond } from "./rules.js";
 
-export const APP_VERSION = "1.2.1";
+export const APP_VERSION = "1.3.0";
 
 /* ================================================================ state */
 const DEFAULT_PALETTE = [
@@ -541,14 +542,14 @@ function viewCombat() {
   const main = order.filter(c => !waiting.includes(c) && !delayed.includes(c) && !c.noTurn);
   const row = c => {
     const cr = crOf(c);
-    const ac = c.kind === "pc" ? null : currentAC(cr, c);
+    const ac = c.kind === "pc" || !cr ? null : acHtml(cr, c);
     return `<li class="crow ${c.uid === enc.active ? "active" : ""} ${c.uid === S.ui.sel ? "sel" : ""} ${c.defeated ? "dead" : ""}" data-act="sel" data-uid="${c.uid}">
       <span class="grip" data-grip="${c.uid}" aria-label="Drag to reorder">⋮⋮</span>
       ${c.noTurn ? `<span class="init blank"></span>` : `<button class="init" data-act="editInit" data-uid="${c.uid}" aria-label="Edit initiative">${c.init}</button>`}
       ${colorDot(c)}
       <span class="cname"><b>${esc(c.name)}</b><span class="cconds">${condChips(c)}</span></span>
       <span class="cstats">${c.hp != null ? `<span class="hpn">${c.hp}${c.temp ? `<small>+${c.temp}</small>` : ""}<small>/${c.maxHp}</small></span>${hpBar(c)}` : ""}
-        ${ac != null ? `<span class="acn">AC ${ac}</span>` : ""}
+        ${ac ? `<span class="acn">AC ${ac}</span>` : ""}
         ${(c.counters || []).map(ct => `<span class="ctn">${esc(ct.label.split(" ")[0])} ${ct.val}</span>`).join("")}</span>
     </li>`;
   };
@@ -617,7 +618,7 @@ function detail(c) {
     </div></div>`;
   // HP block
   if (c.kind !== "pc" && c.hp != null) {
-    const ac = currentAC(cr, c), hard = currentHardness(cr, c);
+    const ac = acHtml(cr, c), hard = currentHardness(cr, c);
     h += `<div class="hpblock ${c.defeated ? "dead" : ""}">
       <div class="hpbig"><span class="lbl">HP</span><b>${c.hp}</b><small>/ ${c.maxHp}</small>${c.temp ? `<span class="temp">+${c.temp} temp</span>` : ""}</div>
       <div class="acbig"><span class="lbl">AC</span><b>${ac}</b>${hard ? `<small>Hardness ${hard}</small>` : ""}</div>
@@ -652,6 +653,50 @@ function durText(d) {
   const nm = who ? who.name : "?";
   return `until ${d.edge} of ${nm}'s ${d.n > 1 ? d.n + " turns" : "next turn"}`;
 }
+// Condition-adjusted roll button. st = stat descriptor (see modifiers.js)
+function adjBtn(c, label, base, st, extra = "") {
+  const p = c ? penalty(c, st) : { total: 0, parts: [] };
+  if (!p.total) return rollBtn(label, base, extra);
+  const why = penaltyText(p);
+  return `<button class="rb adj" title="Base ${sgn(base)}; ${esc(why)}" data-act="roll" data-mod="${base + p.total}" data-label="${esc(`${label} (${why})`)}" ${extra}>${sgn(base + p.total)}<small class="basev">${sgn(base)}</small></button>`;
+}
+function effAC(cr, c) {
+  const base = currentAC(cr, c); if (base == null) return null;
+  const p = penalty(c, { k: "ac" });
+  return { val: base + p.total, base, p };
+}
+function acHtml(cr, c) {
+  const a = effAC(cr, c); if (!a) return "";
+  return a.p.total ? `<span class="adjv" title="Base ${a.base}; ${esc(penaltyText(a.p))}">${a.val}</span><small class="basev">${a.base}</small>` : `${a.val}`;
+}
+const SKILL_NAMES = ["acrobatics", "arcana", "athletics", "computers", "crafting", "deception", "diplomacy", "intimidation", "medicine", "nature", "occultism", "performance", "piloting", "religion", "society", "stealth", "survival", "thievery"];
+function abilityStat(a) {
+  if (a.rollAttack != null && a.rollDamage) return { k: "attack", range: a.range || "melee" };
+  const txt = `${a.rollSkill || ""} ${a.rollLabel || ""} ${a.name}`.toLowerCase();
+  if (/demoraliz/.test(txt)) return { k: "skill", attr: "cha" };
+  const sk = SKILL_NAMES.find(n => txt.includes(n));
+  return { k: "skill", attr: sk ? skillAttr(sk) : null };
+}
+function condSummary(cr, c) {
+  if (!cr || cr.kind === "hazard" && !cr.ac) return "";
+  const items = [];
+  const add = (label, st) => { const p = penalty(c, st); if (p.total) items.push(`<b>${label} ${p.total}</b> <span class="muted">(${esc(penaltyText(p))})</span>`); };
+  add("AC", { k: "ac" });
+  const sv = ["fort", "ref", "will"].map(x => [x, penalty(c, { k: "save", s: x })]);
+  if (sv.every(([, p]) => p.total === sv[0][1].total)) { if (sv[0][1].total) items.push(`<b>Saves ${sv[0][1].total}</b> <span class="muted">(${esc(penaltyText(sv[0][1]))})</span>`); }
+  else for (const [x, p] of sv) if (p.total) items.push(`<b>${{ fort: "Fort", ref: "Ref", will: "Will" }[x]} ${p.total}</b> <span class="muted">(${esc(penaltyText(p))})</span>`);
+  if (cr.kind !== "hazard") {
+    add("Perception", { k: "perception" });
+    const m = penalty(c, { k: "attack", range: "melee" }), r = penalty(c, { k: "attack", range: "ranged" });
+    if (m.total === r.total) { if (m.total) items.push(`<b>Attacks ${m.total}</b> <span class="muted">(${esc(penaltyText(m))})</span>`); }
+    else { if (m.total) items.push(`<b>Melee attacks ${m.total}</b> <span class="muted">(${esc(penaltyText(m))})</span>`); if (r.total) items.push(`<b>Ranged attacks ${r.total}</b> <span class="muted">(${esc(penaltyText(r))})</span>`); }
+    add("Melee damage", { k: "damage", range: "melee" });
+    add("DCs in ability text", { k: "dc" });
+  }
+  const notes = manualNotes(c);
+  if (!items.length && !notes.length) return "";
+  return `<div class="condsum"><span class="lbl">From conditions:</span> ${items.join(" · ")}${notes.map(n => `<div class="muted small">${esc(n)}</div>`).join("")}<div class="muted small">Skills, saves and attacks below already include these. DCs written in ability text don't.</div></div>`;
+}
 function rollBtn(label, mod, extra = "") {
   return `<button class="rb" data-act="roll" data-mod="${mod}" data-label="${esc(label)}" ${extra}>${sgn(mod)}</button>`;
 }
@@ -660,13 +705,14 @@ function activeConds(c, cr, range) {
 }
 function damageLine(c, cr, s, crit) {
   const mode = S.settings.critMode;
-  const base = rollDamage(s.damage, crit, mode);
-  const parts = [{ total: base.total, type: s.type, text: base.text, expr: base.expr }];
+  const dp = penalty(c, { k: "damage", range: s.range || "melee" });
+  const base = rollDamage(dp.total ? `${s.damage}${dp.total}` : s.damage, crit, mode);
+  const parts = [{ total: base.total, type: s.type, text: base.text, expr: base.expr, note: dp.total ? penaltyText(dp) : "" }];
   for (const x of activeConds(c, cr, s.range || "melee")) { const r = rollDamage(x.dice, crit, mode); parts.push({ total: r.total, type: x.type === "same" ? s.type : x.type, text: r.text, expr: r.expr, label: x.label }); }
   const total = parts.reduce((a, q) => a + q.total, 0);
   const desc = parts.map(q => `${q.total} ${q.type}${q.label ? ` (${q.label})` : ""}`).join(" + ");
   // full working, e.g. "1d8+4: [6] +4 = 10 fire + Show No Mercy 2: 2 = 2 fire"
-  const calc = parts.map(q => `${q.label ? q.label + " " : ""}${q.expr}${/d/i.test(q.expr) || crit ? `: ${q.text}` : ""} = ${q.total} ${q.type}`).join("  +  ");
+  const calc = parts.map(q => `${q.label ? q.label + " " : ""}${q.expr}${/d/i.test(q.expr) || crit ? `: ${q.text}` : ""} = ${q.total} ${q.type}${q.note ? ` [${q.note}]` : ""}`).join("  +  ");
   return { total, desc, calc, detail: parts.map(q => q.text).join("; ") };
 }
 function strikeOf(c, el) {
@@ -686,8 +732,8 @@ function statblock(cr, c) {
     const atkAndDmg = a.rollAttack != null && a.rollDamage;
     return `<div class="ability"><b>${esc(a.name)}</b> ${a.cost ? icon(a.cost) : ""}${a.traits ? ` <span class="muted">(${esc(a.traits)})</span>` : ""} ${fmt(a.text)}
       ${(a.refs || []).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
-      ${atkAndDmg ? `<button class="rb atk" data-act="roll" data-strike="1" data-uid="${c.uid}" data-ai="${ai}" data-mod="${a.rollAttack}" data-label="${esc(`${c.name}: ${a.name}`)}">Attack ${sgn(a.rollAttack)}</button>`
-        : a.rollAttack != null ? rollBtn(`${c.name}: ${a.rollLabel || a.name}`, a.rollAttack) : ""}
+      ${atkAndDmg ? (() => { const ap = penalty(c, abilityStat(a)); const m = a.rollAttack + ap.total; return `<button class="rb atk ${ap.total ? "adj" : ""}" data-act="roll" data-strike="1" data-uid="${c.uid}" data-ai="${ai}" data-mod="${m}" data-label="${esc(`${c.name}: ${a.name}${ap.total ? ` (${penaltyText(ap)})` : ""}`)}">Attack ${sgn(m)}</button>`; })()
+        : a.rollAttack != null ? adjBtn(c, `${c.name}: ${a.rollLabel || a.name}`, a.rollAttack, abilityStat(a)) : ""}
       ${a.rollDamage ? `<button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-ai="${ai}" data-label="${esc(c.name + ": " + a.name)}">${esc(a.rollDamage)} ${esc(a.rollType || "")}</button>` : ""}
       ${a.cooldown ? (cd ? `<span class="badge warnb">Recharging: ${cd} round${cd === 1 ? "" : "s"}</span> <button class="mini" data-act="cdClear" data-uid="${c.uid}" data-name="${esc(a.name)}">Reset</button>` : `<button class="rb" data-act="useCd" data-uid="${c.uid}" data-name="${esc(a.name)}" data-expr="${esc(a.cooldown)}">Use (roll ${esc(a.cooldown)})</button>`) : ""}
       ${a.frequency === "round" ? `<button class="rb" aria-pressed="${!!used}" data-act="useRound" data-uid="${c.uid}" data-name="${esc(a.name)}">${used ? "Used this round" : "Mark used"}</button>` : ""}
@@ -695,13 +741,14 @@ function statblock(cr, c) {
   }).join("");
   let h = `<div class="sb">`;
   if (tactics) h += `<div class="tactics"><b>Tactics</b> ${fmt(tactics)}</div>`;
+  h += condSummary(cr, c);
   for (const n of cr.notes || []) h += `<p class="sbnote"><i>${fmt(n)}</i></p>`;
   h += `<div class="traits">${cr.rarity ? `<span class="trait rare">${esc(cr.rarity)}</span>` : ""}${cr.size ? `<span class="trait">${esc(cr.size)}</span>` : ""}${(cr.traits || []).map(t => `<span class="trait">${esc(t)}</span>`).join("")}</div>`;
   if (cr.kind === "hazard") {
     if (cr.routine) h += `<div class="ability"><b>Routine</b> (${cr.routine.actions} actions) ${fmt(cr.routine.text)}
       <button class="rb dmgroll" data-act="rollDmg" data-expr="${esc(cr.routine.damage)}" data-type="${esc(cr.routine.type)}" data-label="${esc(cr.name)} routine">${esc(cr.routine.damage)} ${esc(cr.routine.type)}</button>
       <button class="rb" data-act="areaFromRoutine" data-uid="${c.uid}">Apply to monsters…</button></div>`;
-    if (cr.ac != null || cr.hp != null) h += `<p>${cr.ac != null ? `<b>AC</b> ${currentAC(cr, c)}` : ""}${cr.saves && cr.saves.fort != null ? `; <b>Fort</b> ${rollBtn(`${cr.name}: Fortitude`, cr.saves.fort)}` : ""}${cr.saves && cr.saves.ref != null ? ` <b>Ref</b> ${rollBtn(`${cr.name}: Reflex`, cr.saves.ref)}` : ""}${cr.saves && cr.saves.will != null ? ` <b>Will</b> ${rollBtn(`${cr.name}: Will`, cr.saves.will)}` : ""}${cr.hp != null ? `; <b>HP</b> ${cr.hp}${cr.bt ? ` (BT ${cr.bt})` : ""}` : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.hpNote ? ` <span class="muted">(${fmt(cr.hpNote)})</span>` : ""}</p>`;
+    if (cr.ac != null || cr.hp != null) h += `<p>${cr.ac != null ? `<b>AC</b> ${acHtml(cr, c)}` : ""}${cr.saves && cr.saves.fort != null ? `; <b>Fort</b> ${adjBtn(c, `${cr.name}: Fortitude`, cr.saves.fort, { k: "save", s: "fort" })}` : ""}${cr.saves && cr.saves.ref != null ? ` <b>Ref</b> ${adjBtn(c, `${cr.name}: Reflex`, cr.saves.ref, { k: "save", s: "ref" })}` : ""}${cr.saves && cr.saves.will != null ? ` <b>Will</b> ${adjBtn(c, `${cr.name}: Will`, cr.saves.will, { k: "save", s: "will" })}` : ""}${cr.hp != null ? `; <b>HP</b> ${cr.hp}${cr.bt ? ` (BT ${cr.bt})` : ""}` : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.hpNote ? ` <span class="muted">(${fmt(cr.hpNote)})</span>` : ""}</p>`;
     h += ab("top") + ab("mid") + ab("bottom");
     if (cr.reset) h += `<p><b>Reset</b> ${fmt(cr.reset)}</p>`;
     h += `<hr><p><b>Disable</b> ${fmt(cr.disable)}</p><hr>`;
@@ -726,21 +773,21 @@ function statblock(cr, c) {
       const extras = activeConds(c, cr, s.range);
       h += `<div class="strike"><div><b>${s.range === "melee" ? "Melee" : "Ranged"}</b> ${icon(s.cost || "1")} ${esc(s.name)}
           ${s.traits && s.traits.length ? `<span class="muted">(${s.traits.map(t => esc(t)).join(", ")})</span>` : ""}
-          <span class="dmgtxt">${esc(s.damage)} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${x.type === "same" ? "" : esc(x.type)} (${esc(x.label)})</b>`).join("")}${s.extra ? ` ${fmt(s.extra)}` : ""}</span></div>
+          <span class="dmgtxt">${esc(s.damage)}${(() => { const dp = penalty(c, { k: "damage", range: s.range }); return dp.total ? ` <b class="adjv">${dp.total} (${esc(penaltyText(dp))})</b>` : ""; })()} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${x.type === "same" ? "" : esc(x.type)} (${esc(x.label)})</b>`).join("")}${s.extra ? ` ${fmt(s.extra)}` : ""}</span></div>
         <div class="strike-rolls">
-          ${[1, 2, 3].map(n => { const m = s.bonus + mapPenalty(n, agile); return `<button class="rb atk" data-act="roll" data-strike="1" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-label="${esc(`${c.name}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
+          ${[1, 2, 3].map(n => { const ap = penalty(c, { k: "attack", range: s.range }); const m = s.bonus + mapPenalty(n, agile) + ap.total; const why = ap.total ? ` · ${penaltyText(ap)}` : ""; return `<button class="rb atk ${ap.total ? "adj" : ""}" data-act="roll" data-strike="1" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-label="${esc(`${c.name}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]}${why})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
           <button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name)}">Damage</button>
           <button class="rb dmgroll" data-act="rollDmg" data-crit="1" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name + " (critical)")}">Crit</button>
           ${(s.refs || []).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
         </div></div>`;
     });
     h += ab("bottom");
-    h += `<hr><p><b>AC</b> ${currentAC(cr, c)}${cr.acNote ? ` <span class="muted">(${esc(cr.acNote)})</span>` : ""}; <b>Fort</b> ${rollBtn(`${c.name}: Fortitude`, cr.saves.fort)} <b>Ref</b> ${rollBtn(`${c.name}: Reflex`, cr.saves.ref)} <b>Will</b> ${rollBtn(`${c.name}: Will`, cr.saves.will)}</p>`;
+    h += `<hr><p><b>AC</b> ${acHtml(cr, c)}${cr.acNote ? ` <span class="muted">(${esc(cr.acNote)})</span>` : ""}; <b>Fort</b> ${adjBtn(c, `${c.name}: Fortitude`, cr.saves.fort, { k: "save", s: "fort" })} <b>Ref</b> ${adjBtn(c, `${c.name}: Reflex`, cr.saves.ref, { k: "save", s: "ref" })} <b>Will</b> ${adjBtn(c, `${c.name}: Will`, cr.saves.will, { k: "save", s: "will" })}</p>`;
     h += `<p><b>HP</b> ${cr.hp}${cr.fastHealing ? `, fast healing ${cr.fastHealing}` : ""}${cr.voidHealing ? ", void healing" : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.resistances && cr.resistances.length ? `; <b>Resistances</b> ${esc(cr.resistances.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}</p>`;
     h += ab("mid");
-    h += `<hr><p><b>Perception</b> ${rollBtn(`${c.name}: Perception`, cr.perception)}${cr.senses ? `; ${esc(cr.senses)}` : ""}</p>`;
+    h += `<hr><p><b>Perception</b> ${adjBtn(c, `${c.name}: Perception`, cr.perception, { k: "perception" })}${cr.senses ? `; ${esc(cr.senses)}` : ""}</p>`;
     if (cr.languages) h += `<p><b>Languages</b> ${esc(cr.languages)}</p>`;
-    if (cr.skills && cr.skills.length) h += `<p><b>Skills</b> ${cr.skills.map(s => `${esc(s.name)} ${rollBtn(`${c.name}: ${s.name}`, s.mod)}`).join(" ")}</p>`;
+    if (cr.skills && cr.skills.length) h += `<p><b>Skills</b> ${cr.skills.map(s => `${esc(s.name)} ${adjBtn(c, `${c.name}: ${s.name}`, s.mod, { k: "skill", attr: skillAttr(s.name) })}`).join(" ")}</p>`;
     if (cr.attrs) h += `<p class="attrs">${["str", "dex", "con", "int", "wis", "cha"].map(k => `<span><b>${k[0].toUpperCase() + k.slice(1)}</b> ${sgn(cr.attrs[k])}</span>`).join("")}</p>`;
     if (cr.items) h += `<p><b>Items</b> ${fmt(cr.items)}</p>`;
   }
@@ -1115,7 +1162,7 @@ const A = {
     m.saveRolls = {};
     for (const t of padTargets(m)) {
       const cr = crOf(t); if (!cr || !cr.saves) continue;
-      const mod = cr.saves[m.saveType]; const r = d20(mod); const dg = degree(r.total, r.nat, Number(m.dc));
+      const mod = cr.saves[m.saveType] + penalty(t, { k: "save", s: m.saveType }).total; const r = d20(mod); const dg = degree(r.total, r.nat, Number(m.dc));
       m.saves[t.uid] = { "Critical success": "CS", "Success": "S", "Failure": "F", "Critical failure": "CF" }[dg];
       m.saveRolls[t.uid] = `${r.nat}${sgn(mod)}=${r.total}`;
     }
