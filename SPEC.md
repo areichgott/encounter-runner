@@ -28,6 +28,8 @@ An offline, installable web app (PWA) for running Starfinder 2e / Pathfinder 2e 
 - **Breakable armor**: data-driven alternate state (e.g. Hardness 3 → 0 and AC 16 → 12 when below half HP or on a critical hit), applied automatically.
 - **Rolls**: d20 + modifier for strikes (MAP 1st/2nd/3rd, agile aware), saves, skills, Perception. Attack rolls also show hit and crit damage, including active conditional damage. Crit setting: double the total (official) or roll twice the dice and double flat bonuses (house rule). Natural 1/20 flagged. Optional DC shows degree of success. Roll log.
 - **Conditions**: valued and unvalued, optional duration (N rounds, or until the start/end of a chosen combatant's next turn), rules text one tap away.
+- **Condition penalties**: frightened, sickened, clumsy, enfeebled, stupefied, drained, fatigued, off-guard (and conditions that include it), prone, suppressed, unconscious and fascinated adjust AC, saves, Perception, skills, attacks, Strength melee damage and creature DCs. Same-type penalties don't stack; status and circumstance add. Adjusted numbers show in the warning text color; a summary line under the conditions opens a breakdown. Finesse melee uses the higher of Str/Dex. Drained lowers current and max HP by level × value. Immunities are respected (warning for mental immunity vs frightened).
+- **Attack counter**: the next 1st/2nd/3rd attack button is highlighted per turn; abilities tagged `map: "hold2"` (e.g. Attack Pattern Beta) make two Strikes share a penalty.
 - **Counters**: hazard successes/rounds, ability cooldowns (e.g. 1d4 rounds rolled automatically), once-per-round toggles.
 - **Undo**: last 100 actions.
 
@@ -53,7 +55,7 @@ An offline, installable web app (PWA) for running Starfinder 2e / Pathfinder 2e 
 
 **Npc**: `name, descriptor, wants[], knows[], personality, attitude, tips[], influence{perception, will, discovery, skills[{dc,skill,note}], thresholds[{points,text}], resistances, weaknesses, rounds}`.
 
-Text fields accept `**bold**` and `//italic//`. Rules references (`refs` keys) render as tappable terms.
+Text fields accept `**bold**` and `//italic//`. Creature-imposed DCs are written `DC {dc:N}` (or `{skilldc:Skill}` for a DC derived from a skill) so condition penalties adjust them; pack builders fail on any untagged creature DC or on ability text that mentions the multiple attack penalty without a `map` tag. Rules references (`refs` keys) render as tappable terms.
 
 ## Hosting & install
 

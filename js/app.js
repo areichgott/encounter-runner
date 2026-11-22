@@ -1,8 +1,9 @@
 import { kv, packs as packStore, clearAll, requestPersist } from "./store.js";
 import { CONDITIONS, COND_BY_NAME, QUICK_CONDITIONS, DAMAGE_TYPES, ALL_TYPES } from "./conditions.js";
+import { statCalc, immunityFor } from "./mods.js";
 import { rollExpr, rollDamage, d20, degree, mapPenalty, resolveDamage, currentAC, currentHardness, actionsAtStart, cond } from "./rules.js";
 
-export const APP_VERSION = "1.2.1";
+export const APP_VERSION = "1.3.0";
 
 /* ================================================================ state */
 const DEFAULT_PALETTE = [
@@ -38,9 +39,10 @@ function textOn(hex) {
 }
 const COND_WORDS = ["off-guard", "frightened", "stunned", "slowed", "prone", "grabbed", "restrained", "concealed", "clumsy", "sickened", "fatigued", "immobilized", "invisible", "undetected", "dazzled", "blinded", "enfeebled", "stupefied", "unconscious", "quickened", "drained", "doomed", "confused", "fascinated", "paralyzed", "deafened", "suppressed", "glitching"];
 const COND_RE = new RegExp(`\\b(${COND_WORDS.join("|")})\\b`, "gi");
-function fmt(t, { link = true } = {}) {
+function fmt(t, { link = true, dcf = null } = {}) {
   let s = esc(t);
   if (link) s = s.replace(COND_RE, m => `<button class="tref" data-act="ref" data-ref="cond:${esc(m.toLowerCase())}">${m}</button>`);
+  s = s.replace(/\{(dc|skilldc):([^}]+)\}/g, (m, k, a) => dcf ? dcf(k, a) : (k === "dc" ? a : `${a} DC`));
   s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\/\/(.+?)\/\//g, "<i>$1</i>").replace(/\n/g, "<br>");
   return s;
 }
@@ -425,6 +427,7 @@ function startOfTurn(c) {
       else notes.push(`${k}: ${c.cooldowns[k]} more round${c.cooldowns[k] === 1 ? "" : "s"}`);
     }
     c.used = {};
+    c.atk = { n: 0, hold: 0, holdN: null };
   }
   if (cr && cr.turnTable && cr.turnTable.options && cr.turnTable.options.length) {
     c.conditions = (c.conditions || []).filter(x => x.src !== "table");
@@ -433,7 +436,7 @@ function startOfTurn(c) {
     let extra = "";
     if (opt.heal && c.hp != null) { const r = rollExpr(opt.heal); const b = c.hp; c.hp = Math.min(c.maxHp, c.hp + r.total); if (c.hp > 0) c.defeated = false; extra = ` (regains ${r.total}: HP ${b} → ${c.hp})`; }
     for (const k of opt.conds || []) c.conditions.push({ id: uid(), name: k.name, value: k.value || null, src: "table", untilEnd: !!k.untilEnd });
-    notes.push(`<b>${esc(cr.turnTable.label || "Random state")}: ${esc(opt.name)}</b> — ${fmt(opt.text, { link: false })}${extra}`);
+    notes.push(`<b>${esc(cr.turnTable.label || "Random state")}: ${esc(opt.name)}</b> — ${fmt(opt.text, { link: false, dcf: dcFn(cr, statCalc(c, cr)) })}${extra}`);
   }
   const base = c.kind === "hazard" && cr && cr.routine ? cr.routine.actions : 3;
   const a = actionsAtStart(c, base);
@@ -446,7 +449,7 @@ function endOfTurn(c) {
   const crx = crOf(c);
   if (crx && crx.turnTable && c.tableState) {
     const opt = crx.turnTable.options.find(o => o.name === c.tableState);
-    if (opt && opt.endDamage) { const r = rollExpr(opt.endDamage); notes.push(`<b>${esc(opt.name)}</b>: ${esc(opt.endText || "")} ${esc(opt.endDamage)} = <b>${r.total}</b>`); }
+    if (opt && opt.endDamage) { const r = rollExpr(opt.endDamage); notes.push(`<b>${esc(opt.name)}</b>: ${fmt(opt.endText || "", { link: false, dcf: dcFn(crx, statCalc(c, crx)) })} ${esc(opt.endDamage)} = <b>${r.total}</b>`); }
     const before = c.conditions.length; c.conditions = c.conditions.filter(x => !(x.src === "table" && x.untilEnd));
     if (c.conditions.length < before) notes.push(`${esc(opt ? opt.name : "State")} effect ends`);
   }
@@ -541,14 +544,15 @@ function viewCombat() {
   const main = order.filter(c => !waiting.includes(c) && !delayed.includes(c) && !c.noTurn);
   const row = c => {
     const cr = crOf(c);
-    const ac = c.kind === "pc" ? null : currentAC(cr, c);
+    const acR = c.kind === "pc" || !cr || cr.ac == null ? null : statCalc(c, cr).ac(currentAC(cr, c));
+    const ac = acR ? acR.value : null;
     return `<li class="crow ${c.uid === enc.active ? "active" : ""} ${c.uid === S.ui.sel ? "sel" : ""} ${c.defeated ? "dead" : ""}" data-act="sel" data-uid="${c.uid}">
       <span class="grip" data-grip="${c.uid}" aria-label="Drag to reorder">⋮⋮</span>
       ${c.noTurn ? `<span class="init blank"></span>` : `<button class="init" data-act="editInit" data-uid="${c.uid}" aria-label="Edit initiative">${c.init}</button>`}
       ${colorDot(c)}
       <span class="cname"><b>${esc(c.name)}</b><span class="cconds">${condChips(c)}</span></span>
       <span class="cstats">${c.hp != null ? `<span class="hpn">${c.hp}${c.temp ? `<small>+${c.temp}</small>` : ""}<small>/${c.maxHp}</small></span>${hpBar(c)}` : ""}
-        ${ac != null ? `<span class="acn">AC ${ac}</span>` : ""}
+        ${ac != null ? `<span class="acn ${acR.delta ? "adj" : ""}">AC ${ac}</span>` : ""}
         ${(c.counters || []).map(ct => `<span class="ctn">${esc(ct.label.split(" ")[0])} ${ct.val}</span>`).join("")}</span>
     </li>`;
   };
@@ -616,11 +620,12 @@ function detail(c) {
       <button class="danger" data-act="remove" data-uid="${c.uid}">Remove</button>
     </div></div>`;
   // HP block
+  const scD = cr ? statCalc(c, cr) : null;
   if (c.kind !== "pc" && c.hp != null) {
-    const ac = currentAC(cr, c), hard = currentHardness(cr, c);
+    const acR = scD.ac(currentAC(cr, c)), ac = acR.value, hard = currentHardness(cr, c);
     h += `<div class="hpblock ${c.defeated ? "dead" : ""}">
       <div class="hpbig"><span class="lbl">HP</span><b>${c.hp}</b><small>/ ${c.maxHp}</small>${c.temp ? `<span class="temp">+${c.temp} temp</span>` : ""}</div>
-      <div class="acbig"><span class="lbl">AC</span><b>${ac}</b>${hard ? `<small>Hardness ${hard}</small>` : ""}</div>
+      <div class="acbig ${acR.delta ? "adj" : ""}" ${acR.delta ? `data-act="penBreak" data-uid="${c.uid}"` : ""}><span class="lbl">AC</span><b>${ac}</b>${hard ? `<small>Hardness ${hard}</small>` : ""}</div>
       <div class="hpbtns">
         <button class="dmg big" data-act="pad" data-mode="damage" data-uid="${c.uid}">− Damage</button>
         <button class="heal big" data-act="pad" data-mode="heal" data-uid="${c.uid}">+ Heal</button>
@@ -636,16 +641,28 @@ function detail(c) {
   // conditions
   h += `<div class="conds"><span class="lbl">Conditions</span>
     ${(c.permanent || []).map(p => `<span class="cchip perm">${esc(p.name)} ${p.value || ""} <small>permanent</small></span>`).join("")}
-    ${(c.conditions || []).map(x => `<span class="cchip big">
+    ${(c.conditions || []).map(x => `<span class="cchip big ${x.immune ? "immune" : ""}">
       <button class="cname" data-act="ref" data-ref="cond:${esc(x.name.toLowerCase())}">${esc(x.name === "Persistent Damage" ? `Persistent ${x.ptype || ""} ${x.dice || ""}` : x.name)}</button>
       ${x.value != null && x.name !== "Persistent Damage" ? `<button class="mini" data-act="condVal" data-uid="${c.uid}" data-id="${x.id}" data-d="-1">−</button><b>${x.value}</b><button class="mini" data-act="condVal" data-uid="${c.uid}" data-id="${x.id}" data-d="1">+</button>` : ""}
-      ${x.dur ? `<small class="dur">${esc(durText(x.dur))}</small>` : ""}
+      ${x.immune ? `<small class="dur">immune</small>` : ""}${x.dur ? `<small class="dur">${esc(durText(x.dur))}</small>` : ""}
       <button class="mini x" data-act="condDel" data-uid="${c.uid}" data-id="${x.id}" aria-label="Remove">×</button></span>`).join("")}
     <button class="addc" data-act="condAdd" data-uid="${c.uid}">+ Condition</button></div>`;
+  if (scD && scD.any) h += `<button class="pensum" data-act="penBreak" data-uid="${c.uid}">${esc(scD.summary())} <span class="muted">ⓘ</span></button>`;
   if (cr) h += statblock(cr, c);
   else if (c.kind === "pc") h += `<p class="muted">Players track their own HP. Conditions here get end-of-turn reminders (frightened drops automatically).</p>`;
   h += `</div>`;
   return h;
+}
+// Drained: lose level × value HP and max HP (level minimum 1); lowering it restores max HP but not the lost HP.
+function applyDrain(c, oldVal, newVal) {
+  if (c.hp == null || c.kind === "pc") return;
+  const cr = crOf(c); const lvl = Math.max(1, Number(cr && cr.level) || 1);
+  const delta = lvl * ((newVal || 0) - (oldVal || 0));
+  if (!delta) return;
+  c.maxHp -= delta;
+  if (delta > 0) c.hp = Math.max(0, c.hp - delta);
+  c.hp = Math.min(c.hp, c.maxHp);
+  logLine(`${c.name}: drained ${newVal} (max HP ${c.maxHp + delta} → ${c.maxHp}${delta > 0 ? `, loses ${delta} HP` : ""})`);
 }
 function durText(d) {
   const who = S.enc.combatants.find(c => c.uid === d.who);
@@ -663,59 +680,88 @@ function damageLine(c, cr, s, crit) {
   const base = rollDamage(s.damage, crit, mode);
   const parts = [{ total: base.total, type: s.type, text: base.text, expr: base.expr }];
   for (const x of activeConds(c, cr, s.range || "melee")) { const r = rollDamage(x.dice, crit, mode); parts.push({ total: r.total, type: x.type === "same" ? s.type : x.type, text: r.text, expr: r.expr, label: x.label }); }
+  // condition penalties to damage (e.g. enfeebled on Strength melee); doubled on a crit like other modifiers
+  const pen = statCalc(c, cr).damage(s);
+  let penText = "";
+  if (pen.delta) {
+    const v = pen.delta * (crit ? 2 : 1);
+    const before = parts[0].total; parts[0].total = Math.max(1, parts[0].total + v);
+    penText = `  ${pen.parts.map(q => q.cond).join(", ")} ${v} (${before} → ${parts[0].total})`;
+  }
   const total = parts.reduce((a, q) => a + q.total, 0);
   const desc = parts.map(q => `${q.total} ${q.type}${q.label ? ` (${q.label})` : ""}`).join(" + ");
-  // full working, e.g. "1d8+4: [6] +4 = 10 fire + Show No Mercy 2: 2 = 2 fire"
-  const calc = parts.map(q => `${q.label ? q.label + " " : ""}${q.expr}${/d/i.test(q.expr) || crit ? `: ${q.text}` : ""} = ${q.total} ${q.type}`).join("  +  ");
+  const calc = parts.map((q, i) => `${q.label ? q.label + " " : ""}${q.expr}${/d/i.test(q.expr) || crit ? `: ${q.text}` : ""}${i === 0 && penText ? penText.replace(/^\s+/, " ") : ""} = ${q.total} ${q.type}`).join("  +  ");
   return { total, desc, calc, detail: parts.map(q => q.text).join("; ") };
 }
 function strikeOf(c, el) {
   const cr = crOf(c); if (!cr) return null;
   if (el.dataset.si != null) return cr.strikes[+el.dataset.si];
-  if (el.dataset.ai != null) { const a = cr.abilities[+el.dataset.ai]; return { name: a.name, damage: a.rollDamage, type: a.rollType || "", range: a.range || "melee" }; }
+  if (el.dataset.ai != null) { const a = cr.abilities[+el.dataset.ai]; return { name: a.name, damage: a.rollDamage, type: a.rollType || "", range: a.range || "melee", traits: [] }; }
   return null;
 }
+// DC tokens in data text: {dc:14} and {skilldc:Stealth}
+function dcFn(cr, sc) {
+  return (kind, arg) => {
+    let base;
+    if (kind === "dc") base = Number(arg);
+    else { const sk = (cr && cr.skills || []).find(x => x.name.toLowerCase() === String(arg).toLowerCase()); base = sk ? 10 + sk.mod : null; if (base == null) return esc(arg + " DC"); const r = sc ? sc.skill(sk.name, sk.mod) : null; if (r && r.delta) return `<span class="adjv" title="${esc(r.parts.map(q => q.cond).join(", "))}">${10 + r.value}</span>`; return String(base); }
+    if (!sc) return String(base);
+    const r = sc.dc(base);
+    return r.delta ? `<span class="adjv" title="${esc(r.parts.map(q => q.cond + " " + q.value).join(", "))}">${r.value}</span>` : String(base);
+  };
+}
+function partsNote(r) { return r && r.delta ? r.parts.map(q => `${q.cond.toLowerCase()} (${String(q.value).replace("-", "−")})`).join(", ") : ""; }
+function adjBtn(label, r, extra = "") {
+  return `<button class="rb ${r.delta ? "adj" : ""}" data-act="roll" data-mod="${r.value}" data-label="${esc(label)}" data-note="${esc(partsNote(r))}" ${extra}>${sgn(r.value)}</button>`;
+}
+function adjNum(r) { return r.delta ? `<span class="adjv">${r.value}</span>` : String(r.value); }
 function statblock(cr, c) {
   const enc = S.enc; const p = pack(enc.packId); const sec = sectionOf(enc.packId, enc.secId);
+  const sc = statCalc(c, cr); const dcf = dcFn(cr, sc);
+  const F = t => fmt(t, { dcf });
   const tactics = sec && sec.tactics && sec.tactics[c.creatureId];
   const allRefs = [...(cr.refs || [])];
+  const atk = c.atk || { n: 0, hold: 0, holdN: null };
+  const nextN = atk.hold && atk.holdN ? atk.holdN : Math.min(3, (atk.n || 0) + 1);
   const ab = place => (cr.abilities || []).map((a, ai) => ({ a, ai })).filter(({ a }) => (a.place || "bottom") === place).map(({ a, ai }) => {
     (a.refs || []).forEach(r => allRefs.push(r));
     const cd = c.cooldowns && c.cooldowns[a.name];
     const used = c.used && c.used[a.name];
     const atkAndDmg = a.rollAttack != null && a.rollDamage;
-    return `<div class="ability"><b>${esc(a.name)}</b> ${a.cost ? icon(a.cost) : ""}${a.traits ? ` <span class="muted">(${esc(a.traits)})</span>` : ""} ${fmt(a.text)}
+    const ra = a.rollAttack != null ? (atkAndDmg ? sc.attack({ range: a.range || "melee", traits: [] }, a.rollAttack) : sc.dc(a.rollAttack)) : null;
+    return `<div class="ability"><b>${esc(a.name)}</b> ${a.cost ? icon(a.cost) : ""}${a.traits ? ` <span class="muted">(${esc(a.traits)})</span>` : ""} ${F(a.text)}
       ${(a.refs || []).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
-      ${atkAndDmg ? `<button class="rb atk" data-act="roll" data-strike="1" data-uid="${c.uid}" data-ai="${ai}" data-mod="${a.rollAttack}" data-label="${esc(`${c.name}: ${a.name}`)}">Attack ${sgn(a.rollAttack)}</button>`
-        : a.rollAttack != null ? rollBtn(`${c.name}: ${a.rollLabel || a.name}`, a.rollAttack) : ""}
+      ${atkAndDmg ? `<button class="rb atk ${ra.delta ? "adj" : ""}" data-act="roll" data-strike="1" data-uid="${c.uid}" data-ai="${ai}" data-mod="${ra.value}" data-note="${esc(partsNote(ra))}" data-label="${esc(`${c.name}: ${a.name}`)}">Attack ${sgn(ra.value)}</button>`
+        : ra ? adjBtn(`${c.name}: ${a.rollLabel || a.name}`, ra) : ""}
       ${a.rollDamage ? `<button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-ai="${ai}" data-label="${esc(c.name + ": " + a.name)}">${esc(a.rollDamage)} ${esc(a.rollType || "")}</button>` : ""}
+      ${a.map === "hold2" ? (atk.hold ? `<span class="badge">Next ${atk.hold} Strike${atk.hold === 1 ? "" : "s"} share a penalty</span>` : `<button class="rb" data-act="mapHold" data-uid="${c.uid}">Use (next 2 Strikes share a penalty)</button>`) : ""}
       ${a.cooldown ? (cd ? `<span class="badge warnb">Recharging: ${cd} round${cd === 1 ? "" : "s"}</span> <button class="mini" data-act="cdClear" data-uid="${c.uid}" data-name="${esc(a.name)}">Reset</button>` : `<button class="rb" data-act="useCd" data-uid="${c.uid}" data-name="${esc(a.name)}" data-expr="${esc(a.cooldown)}">Use (roll ${esc(a.cooldown)})</button>`) : ""}
       ${a.frequency === "round" ? `<button class="rb" aria-pressed="${!!used}" data-act="useRound" data-uid="${c.uid}" data-name="${esc(a.name)}">${used ? "Used this round" : "Mark used"}</button>` : ""}
     </div>`;
   }).join("");
   let h = `<div class="sb">`;
-  if (tactics) h += `<div class="tactics"><b>Tactics</b> ${fmt(tactics)}</div>`;
-  for (const n of cr.notes || []) h += `<p class="sbnote"><i>${fmt(n)}</i></p>`;
+  if (tactics) h += `<div class="tactics"><b>Tactics</b> ${F(tactics)}</div>`;
+  for (const n of cr.notes || []) h += `<p class="sbnote"><i>${F(n)}</i></p>`;
   h += `<div class="traits">${cr.rarity ? `<span class="trait rare">${esc(cr.rarity)}</span>` : ""}${cr.size ? `<span class="trait">${esc(cr.size)}</span>` : ""}${(cr.traits || []).map(t => `<span class="trait">${esc(t)}</span>`).join("")}</div>`;
+  const saveBtns = () => ["fort", "ref", "will"].filter(k => cr.saves && cr.saves[k] != null).map(k => `<b>${{ fort: "Fort", ref: "Ref", will: "Will" }[k]}</b> ${adjBtn(`${c.name}: ${{ fort: "Fortitude", ref: "Reflex", will: "Will" }[k]}`, sc.save(k, cr.saves[k]))}`).join(" ");
   if (cr.kind === "hazard") {
-    if (cr.routine) h += `<div class="ability"><b>Routine</b> (${cr.routine.actions} actions) ${fmt(cr.routine.text)}
+    if (cr.routine) h += `<div class="ability"><b>Routine</b> (${cr.routine.actions} actions) ${F(cr.routine.text)}
       <button class="rb dmgroll" data-act="rollDmg" data-expr="${esc(cr.routine.damage)}" data-type="${esc(cr.routine.type)}" data-label="${esc(cr.name)} routine">${esc(cr.routine.damage)} ${esc(cr.routine.type)}</button>
       <button class="rb" data-act="areaFromRoutine" data-uid="${c.uid}">Apply to monsters…</button></div>`;
-    if (cr.ac != null || cr.hp != null) h += `<p>${cr.ac != null ? `<b>AC</b> ${currentAC(cr, c)}` : ""}${cr.saves && cr.saves.fort != null ? `; <b>Fort</b> ${rollBtn(`${cr.name}: Fortitude`, cr.saves.fort)}` : ""}${cr.saves && cr.saves.ref != null ? ` <b>Ref</b> ${rollBtn(`${cr.name}: Reflex`, cr.saves.ref)}` : ""}${cr.saves && cr.saves.will != null ? ` <b>Will</b> ${rollBtn(`${cr.name}: Will`, cr.saves.will)}` : ""}${cr.hp != null ? `; <b>HP</b> ${cr.hp}${cr.bt ? ` (BT ${cr.bt})` : ""}` : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.hpNote ? ` <span class="muted">(${fmt(cr.hpNote)})</span>` : ""}</p>`;
     h += ab("top") + ab("mid") + ab("bottom");
-    if (cr.reset) h += `<p><b>Reset</b> ${fmt(cr.reset)}</p>`;
-    h += `<hr><p><b>Disable</b> ${fmt(cr.disable)}</p><hr>`;
-    if (cr.stealthDC != null) h += `<p><b>Stealth DC</b> ${cr.stealthDC} ${cr.stealthNote ? fmt("(" + cr.stealthNote + ")") : ""}</p>`;
-    else if (cr.stealth != null) h += `<p><b>Stealth</b> ${rollBtn(`${cr.name}: Stealth`, cr.stealth)} ${cr.stealthNote ? fmt("(" + cr.stealthNote + ")") : ""}</p>`;
-    if (cr.description) h += `<p><b>Description</b> ${fmt(cr.description)}</p>`;
+    if (cr.reset) h += `<p><b>Reset</b> ${F(cr.reset)}</p>`;
+    if (cr.ac != null || cr.hp != null) h += `<p>${cr.ac != null ? `<b>AC</b> ${adjNum(sc.ac(currentAC(cr, c)))}; ` : ""}${saveBtns()}${cr.hp != null ? `; <b>HP</b> ${cr.hp}${cr.bt ? ` (BT ${cr.bt})` : ""}` : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.hpNote ? ` <span class="muted">(${F(cr.hpNote)})</span>` : ""}</p>`;
+    h += `<hr><p><b>Disable</b> ${F(cr.disable)}</p><hr>`;
+    if (cr.stealthDC != null) h += `<p><b>Stealth DC</b> ${cr.stealthDC} ${cr.stealthNote ? F("(" + cr.stealthNote + ")") : ""}</p>`;
+    else if (cr.stealth != null) h += `<p><b>Stealth</b> ${adjBtn(`${cr.name}: Stealth`, sc.skill("Stealth", cr.stealth))} ${cr.stealthNote ? F("(" + cr.stealthNote + ")") : ""}</p>`;
+    if (cr.description) h += `<p><b>Description</b> ${F(cr.description)}</p>`;
   } else {
     h += ab("top");
-    // conditional damage toggles
     if (cr.conditional && cr.conditional.length) {
       h += `<div class="condtoggles">${cr.conditional.map(x => {
         const on = !!(c.toggles || {})[x.id];
         return `<span class="ctog"><button class="togchip" aria-pressed="${on}" data-act="toggleCond" data-hold="toggleCondAll" data-uid="${c.uid}" data-id="${esc(x.id)}">
-          <span class="tl">${on ? "✓ " : ""}${esc(x.label)}</span><span class="ts">+${esc(x.dice)} ${x.type === "same" ? "damage" : esc(x.type)} · ${x.applies === "all" ? "all attacks" : x.applies + " attacks"}</span><span class="th">hold = all</span></button>
+          <span class="tl">${on ? "✓ " : ""}${esc(x.label)}</span><span class="ts">+${esc(x.dice)} ${x.type === "same" ? "damage" : esc(x.type)} · ${x.applies === "all" ? "all attacks" : x.applies + " attacks"}</span>${S.settings.tipHold ? "" : `<span class="th">hold = all</span>`}</button>
           <button class="mini allbtn" data-act="toggleCondAll" data-uid="${c.uid}" data-id="${esc(x.id)}">All ${esc(cr.name)}</button></span>`;
       }).join("")}</div>`;
     }
@@ -724,27 +770,29 @@ function statblock(cr, c) {
       (s.refs || []).forEach(r => allRefs.push(r));
       const agile = (s.traits || []).includes("agile");
       const extras = activeConds(c, cr, s.range);
+      const ar = sc.attack(s, s.bonus);
       h += `<div class="strike"><div><b>${s.range === "melee" ? "Melee" : "Ranged"}</b> ${icon(s.cost || "1")} ${esc(s.name)}
           ${s.traits && s.traits.length ? `<span class="muted">(${s.traits.map(t => esc(t)).join(", ")})</span>` : ""}
-          <span class="dmgtxt">${esc(s.damage)} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${x.type === "same" ? "" : esc(x.type)} (${esc(x.label)})</b>`).join("")}${s.extra ? ` ${fmt(s.extra)}` : ""}</span></div>
+          <span class="dmgtxt">${esc(s.damage)} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${x.type === "same" ? "" : esc(x.type)} (${esc(x.label)})</b>`).join("")}${s.extra ? ` ${F(s.extra)}` : ""}</span></div>
         <div class="strike-rolls">
-          ${[1, 2, 3].map(n => { const m = s.bonus + mapPenalty(n, agile); return `<button class="rb atk" data-act="roll" data-strike="1" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-label="${esc(`${c.name}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
+          ${[1, 2, 3].map(n => { const m = ar.value + mapPenalty(n, agile); return `<button class="rb atk ${ar.delta ? "adj" : ""} ${n === nextN ? "next" : ""}" data-act="roll" data-strike="1" data-n="${n}" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-note="${esc(partsNote(ar))}" data-label="${esc(`${c.name}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
           <button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name)}">Damage</button>
           <button class="rb dmgroll" data-act="rollDmg" data-crit="1" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name + " (critical)")}">Crit</button>
           ${(s.refs || []).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
         </div></div>`;
     });
     h += ab("bottom");
-    h += `<hr><p><b>AC</b> ${currentAC(cr, c)}${cr.acNote ? ` <span class="muted">(${esc(cr.acNote)})</span>` : ""}; <b>Fort</b> ${rollBtn(`${c.name}: Fortitude`, cr.saves.fort)} <b>Ref</b> ${rollBtn(`${c.name}: Reflex`, cr.saves.ref)} <b>Will</b> ${rollBtn(`${c.name}: Will`, cr.saves.will)}</p>`;
+    h += `<hr><p><b>AC</b> ${adjNum(sc.ac(currentAC(cr, c)))}${cr.acNote ? ` <span class="muted">(${esc(cr.acNote)})</span>` : ""}; ${saveBtns()}</p>`;
     h += `<p><b>HP</b> ${cr.hp}${cr.fastHealing ? `, fast healing ${cr.fastHealing}` : ""}${cr.voidHealing ? ", void healing" : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.resistances && cr.resistances.length ? `; <b>Resistances</b> ${esc(cr.resistances.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}</p>`;
     h += ab("mid");
-    h += `<hr><p><b>Perception</b> ${rollBtn(`${c.name}: Perception`, cr.perception)}${cr.senses ? `; ${esc(cr.senses)}` : ""}</p>`;
+    h += `<hr><p><b>Perception</b> ${adjBtn(`${c.name}: Perception`, sc.perception(cr.perception))}${cr.senses ? `; ${esc(cr.senses)}` : ""}</p>`;
     if (cr.languages) h += `<p><b>Languages</b> ${esc(cr.languages)}</p>`;
-    if (cr.skills && cr.skills.length) h += `<p><b>Skills</b> ${cr.skills.map(s => `${esc(s.name)} ${rollBtn(`${c.name}: ${s.name}`, s.mod)}`).join(" ")}</p>`;
+    if (cr.skills && cr.skills.length) h += `<p><b>Skills</b> ${cr.skills.map(s => `${esc(s.name)} ${adjBtn(`${c.name}: ${s.name}`, sc.skill(s.name, s.mod))}`).join(" ")}</p>`;
     if (cr.attrs) h += `<p class="attrs">${["str", "dex", "con", "int", "wis", "cha"].map(k => `<span><b>${k[0].toUpperCase() + k.slice(1)}</b> ${sgn(cr.attrs[k])}</span>`).join("")}</p>`;
-    if (cr.items) h += `<p><b>Items</b> ${fmt(cr.items)}</p>`;
+    if (cr.items) h += `<p><b>Items</b> ${F(cr.items)}</p>`;
   }
-  h += refChips(allRefs, enc.packId);
+  const rc = refChips(allRefs, enc.packId);
+  if (rc) h += `<details class="rulesbox"><summary>Rules ▸</summary>${rc}</details>`;
   h += `<p class="muted small src">${esc(cr.source || "")}${cr.sourceOverride ? ` · ${esc(cr.sourceOverride)}` : ""}${p.lookupsAsOf ? ` · rules checked ${esc(p.lookupsAsOf)}` : ""}</p>`;
   return h + `</div>`;
 }
@@ -762,6 +810,7 @@ function renderModal() {
   else if (m.type === "menu") inner = modalMenu();
   else if (m.type === "prompt") inner = modalPrompt(m);
   else if (m.type === "add") inner = modalAdd(m);
+  else if (m.type === "pen") inner = modalPen(m);
   else if (m.type === "setupAdd") { const p = pack(S.setup.packId); inner = `<h3>Add to this encounter</h3><div class="addlist">${Object.entries(p.creatures).map(([id, cr]) => `<button data-act="setupAddPick" data-id="${esc(id)}">${esc(cr.name)} <span class="muted">${cr.kind === "hazard" ? "Hazard" : "Creature"} ${cr.level}</span></button>`).join("")}</div><div class="row end"><button data-act="closeModal">Close</button></div>`; }
   else if (m.type === "confirm") inner = `<h3>${esc(m.title)}</h3><p>${m.text || ""}</p><div class="row end"><button data-act="closeModal">Cancel</button><button class="primary ${m.danger ? "danger-bg" : ""}" data-act="confirmYes">${esc(m.yes || "OK")}</button></div>`;
   else if (m.type === "colors") inner = `<h3>Mini color</h3><div class="swatchgrid">${S.settings.palette.map((p, i) => `<button class="swatch" style="background:${p.c};color:${textOn(p.c)}" data-act="pickColor" data-i="${i}">${esc(p.n)}</button>`).join("")}<button class="swatch" data-act="pickColor" data-i="-1">None</button></div>`;
@@ -772,6 +821,22 @@ function modalRef(m) {
   const r = refText(m.ref, S.enc ? S.enc.packId : null);
   if (!r) return `<h3>Not found</h3><p>No rules text for “${esc(m.ref)}”.</p><div class="row end"><button data-act="closeModal">Close</button></div>`;
   return `<h3>${esc(r.name)} <span class="muted small">${esc(r.kind)}</span></h3><div class="reftext">${fmt(r.text)}</div><p class="muted small">${esc(r.source || "")}</p><div class="row end"><button data-act="closeModal">Close</button></div>`;
+}
+function modalPen(m) {
+  const c = findC(m.uid); const cr = crOf(c); const sc = statCalc(c, cr);
+  const row = (lbl, r) => r.delta ? `<tr><td>${esc(lbl)}</td><td class="num">${r.base}</td><td>${r.parts.map(q => `${q.value} ${esc(q.cond)} <span class="muted">(${q.type})</span>`).join("<br>").replace(/-(\d)/g, "−$1")}</td><td class="num"><b>${r.value}</b></td></tr>` : "";
+  let rows = "";
+  if (cr.ac != null) rows += row("AC", sc.ac(currentAC(cr, c)));
+  for (const [k, l] of [["fort", "Fortitude"], ["ref", "Reflex"], ["will", "Will"]]) if (cr.saves && cr.saves[k] != null) rows += row(l, sc.save(k, cr.saves[k]));
+  if (cr.perception != null) rows += row("Perception", sc.perception(cr.perception));
+  for (const s of cr.strikes || []) rows += row(`${s.name} attack`, sc.attack(s, s.bonus));
+  for (const s of cr.strikes || []) { const d = sc.damage(s); if (d.delta) rows += row(`${s.name} damage`, { ...d, base: "dmg", value: `${d.delta}` }); }
+  for (const s of cr.skills || []) rows += row(s.name, sc.skill(s.name, s.mod));
+  const dcR = sc.dc(0); if (dcR.delta) rows += `<tr><td>DCs it imposes</td><td></td><td>${dcR.parts.map(q => `${q.value} ${esc(q.cond)}`).join("<br>").replace(/-(\d)/g, "−$1")}</td><td class="num"><b>${sgn(dcR.delta)}</b></td></tr>`;
+  return `<h3>${esc(c.name)}: condition penalties</h3>
+    <p class="muted small">Penalties of the same type don't stack (only the worst counts); status and circumstance penalties add together.</p>
+    <table class="pentab"><thead><tr><th>Stat</th><th>Base</th><th>Penalties</th><th>Now</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="row end"><button data-act="closeModal">Close</button></div>`;
 }
 function modalMenu() {
   return `<h3>Encounter</h3><div class="menu">
@@ -1000,8 +1065,18 @@ const A = {
   clearRoll: () => { S.ui.lastRoll = null; render(); },
   roll: el => {
     const mod = Number(el.dataset.mod); const r = d20(mod);
+    if (el.dataset.strike && el.dataset.uid && S.enc) {
+      const c0 = findC(el.dataset.uid);
+      if (c0) {
+        S.undo.push(JSON.stringify(S.enc)); if (S.undo.length > 100) S.undo.shift();
+        const a = c0.atk || (c0.atk = { n: 0, hold: 0, holdN: null });
+        const n = Number(el.dataset.n) || Math.min(3, a.n + 1);
+        if (a.hold > 0) { if (!a.holdN) a.holdN = n; a.hold--; if (a.hold === 0) { a.n = Math.min(3, a.holdN + 1); a.holdN = null; } }
+        else a.n = n;
+      }
+    }
     const flag = r.nat === 20 ? ' <span class="nat20">NAT 20</span>' : r.nat === 1 ? ' <span class="nat1">NAT 1</span>' : "";
-    let txt = `${esc(el.dataset.label)}: <span class="die">${r.nat}</span> ${sgn(mod)} = <b class="rtotal">${r.total}</b>${flag}`;
+    let txt = `${esc(el.dataset.label)}: <span class="die">${r.nat}</span> ${sgn(mod)} = <b class="rtotal">${r.total}</b>${flag}${el.dataset.note ? ` <small class="incl">includes ${esc(el.dataset.note)}</small>` : ""}`;
     if (el.dataset.strike && el.dataset.uid) {
       const c = findC(el.dataset.uid); const cr = c && crOf(c); const s = c && strikeOf(c, el);
       if (s && s.damage) {
@@ -1024,6 +1099,8 @@ const A = {
     }
     showRoll(txt, txt.replace(/<[^>]+>/g, ""));
   },
+  mapHold: el => mutate(() => { const c = findC(el.dataset.uid); c.atk = c.atk || { n: 0, hold: 0, holdN: null }; c.atk.hold = 2; c.atk.holdN = null; }),
+  penBreak: el => openModal({ type: "pen", uid: el.dataset.uid }),
   toggleCond: el => {
     const c = findC(el.dataset.uid); const cr = crOf(c); const x = cr.conditional.find(y => y.id === el.dataset.id);
     mutate(() => { c.toggles = c.toggles || {}; c.toggles[x.id] = !c.toggles[x.id]; });
@@ -1069,17 +1146,22 @@ const A = {
       const c = findC(m.uid);
       const x = { id: uid(), name: def.name, value: def.valued && def.name !== "Persistent Damage" ? m.value : null };
       if (def.name === "Persistent Damage") { x.dice = m.dice || "1d6"; x.ptype = m.ptype || "fire"; }
+      const imm = c.kind !== "pc" ? immunityFor(crOf(c), def.name) : { immune: false, warn: "" };
+      if (imm.immune) x.immune = true;
+      if (imm.warn) setTimeout(() => toast(esc(imm.warn), 5000), 50);
       if (m.edge) x.dur = { who: m.who, edge: m.edge, n: Number(m.n) || 1, skip: m.edge === "end" && m.who === S.enc.active };
       // valued conditions don't stack: keep the higher
       const ex = def.name !== "Persistent Damage" && c.conditions.find(y => y.name === def.name);
+      const oldDrain = def.name === "Drained" ? ((ex && ex.value) || 0) : null;
       if (ex) { if (def.valued) ex.value = Math.max(ex.value || 0, x.value || 0); if (x.dur) ex.dur = x.dur; }
       else c.conditions.push(x);
+      if (def.name === "Drained" && !x.immune) applyDrain(c, oldDrain, (ex || x).value || 0);
       logLine(`${c.name}: ${def.name}${x.value ? " " + x.value : ""}${x.dice ? ` ${x.dice} ${x.ptype}` : ""}${x.dur ? " (" + durText(x.dur) + ")" : ""}`);
       S.ui.modal = null;
     });
   },
-  condVal: el => mutate(() => { const c = findC(el.dataset.uid); const x = c.conditions.find(y => y.id === el.dataset.id); x.value = Math.max(0, (x.value || 0) + Number(el.dataset.d)); if (x.value === 0) c.conditions = c.conditions.filter(y => y !== x); }),
-  condDel: el => mutate(() => { const c = findC(el.dataset.uid); c.conditions = c.conditions.filter(y => y.id !== el.dataset.id); }),
+  condVal: el => mutate(() => { const c = findC(el.dataset.uid); const x = c.conditions.find(y => y.id === el.dataset.id); const old = x.value || 0; x.value = Math.max(0, old + Number(el.dataset.d)); if (x.name === "Drained" && !x.immune) applyDrain(c, old, x.value); if (x.value === 0) c.conditions = c.conditions.filter(y => y !== x); }),
+  condDel: el => mutate(() => { const c = findC(el.dataset.uid); const x = c.conditions.find(y => y.id === el.dataset.id); if (x && x.name === "Drained" && !x.immune) applyDrain(c, x.value || 0, 0); c.conditions = c.conditions.filter(y => y.id !== el.dataset.id); }),
   pad: el => {
     const c = findC(el.dataset.uid); const cr = crOf(c);
     const defType = (cr && cr.weaknesses && cr.weaknesses[0] && "slashing") || "slashing";
@@ -1089,8 +1171,9 @@ const A = {
     const c = findC(el.dataset.uid); const cr = crOf(c); const r = cr.routine;
     const roll = rollExpr(r.damage);
     const monsters = S.enc.combatants.filter(x => x.kind === "monster" && !x.defeated && !(x.joinsRound && S.enc.round < x.joinsRound));
-    S.ui.lastRoll = `${esc(cr.name)} routine: ${esc(r.damage)} → ${esc(roll.text)} = <b class="rtotal">${roll.total}</b> ${esc(r.type)} (DC ${r.dc} basic ${r.save === "will" ? "Will" : r.save === "fort" ? "Fortitude" : "Reflex"})`;
-    openModal({ type: "pad", mode: "damage", targets: monsters.map(x => ({ uid: x.uid })), comps: [{ amount: roll.total, type: r.type }], ci: 0, area: true, saves: {}, saveType: r.save, dc: r.dc });
+    const dc = statCalc(c, cr).dc(r.dc).value;
+    S.ui.lastRoll = `${esc(cr.name)} routine: ${esc(r.damage)} → ${esc(roll.text)} = <b class="rtotal">${roll.total}</b> ${esc(r.type)} (DC ${dc} basic ${r.save === "will" ? "Will" : r.save === "fort" ? "Fortitude" : "Reflex"})`;
+    openModal({ type: "pad", mode: "damage", targets: monsters.map(x => ({ uid: x.uid })), comps: [{ amount: roll.total, type: r.type }], ci: 0, area: true, saves: {}, saveType: r.save, dc });
   },
   padMode: el => { S.ui.modal.mode = el.dataset.mode; renderModal(); },
   padKey: el => {
@@ -1115,7 +1198,7 @@ const A = {
     m.saveRolls = {};
     for (const t of padTargets(m)) {
       const cr = crOf(t); if (!cr || !cr.saves) continue;
-      const mod = cr.saves[m.saveType]; const r = d20(mod); const dg = degree(r.total, r.nat, Number(m.dc));
+      const mod = statCalc(t, cr).save(m.saveType, cr.saves[m.saveType]).value; const r = d20(mod); const dg = degree(r.total, r.nat, Number(m.dc));
       m.saves[t.uid] = { "Critical success": "CS", "Success": "S", "Failure": "F", "Critical failure": "CF" }[dg];
       m.saveRolls[t.uid] = `${r.nat}${sgn(mod)}=${r.total}`;
     }

@@ -292,3 +292,18 @@ button.heal{background:var(--heal);border-color:var(--heal);color:#fff;font-weig
 }
 
 .crow .init.blank{background:transparent;border-color:transparent}
+
+/* condition penalties */
+.adj,.adjv{color:var(--warn)!important}
+
+.acbig.adj{cursor:pointer}
+.acn.adj{font-weight:700}
+.rb.atk.next{box-shadow:0 0 0 2px var(--accent);border-color:var(--accent)}
+.pensum{display:block;width:100%;text-align:left;justify-content:flex-start;background:var(--warnbg);color:var(--warn);border-color:var(--warn);min-height:2.4rem;margin:-.3rem 0 .7rem;font-weight:600}
+.cchip.immune{opacity:.55;text-decoration:line-through}
+.incl{color:var(--ink2);font-size:.85rem;margin-left:.4rem}
+.rulesbox{margin-top:.6rem}.rulesbox summary{cursor:pointer;color:var(--ink2);list-style:none;min-height:2.2rem;display:inline-flex;align-items:center}
+.rulesbox summary::-webkit-details-marker{display:none}
+.rulesbox[open] summary{color:var(--ink)}
+.pentab{width:100%;border-collapse:collapse}.pentab th{text-align:left;color:var(--ink2);font-weight:400;font-size:.85rem}
+.pentab td,.pentab th{padding:.35rem .4rem;border-top:1px solid var(--line);vertical-align:top}.pentab .num{text-align:right;white-space:nowrap}
