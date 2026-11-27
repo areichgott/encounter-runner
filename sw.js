@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION on every release.
-const VERSION = "er-v1.3.0";
+const VERSION = "er-v1.5.0";
 const SHELL = [
   "./", "./index.html", "./manifest.webmanifest", "./css/app.css",
   "./js/app.js", "./js/rules.js", "./js/store.js", "./js/conditions.js", "./js/mods.js",

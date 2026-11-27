@@ -3,7 +3,7 @@ import { CONDITIONS, COND_BY_NAME, QUICK_CONDITIONS, DAMAGE_TYPES, ALL_TYPES } f
 import { statCalc, immunityFor } from "./mods.js";
 import { rollExpr, rollDamage, d20, degree, mapPenalty, resolveDamage, currentAC, currentHardness, actionsAtStart, cond } from "./rules.js";
 
-export const APP_VERSION = "1.3.0";
+export const APP_VERSION = "1.5.0";
 
 /* ================================================================ state */
 const DEFAULT_PALETTE = [
@@ -21,7 +21,8 @@ const S = {
   enc: null,          // active encounter
   undo: [],
   setup: null,        // draft encounter setup
-  secState: {},       // "pack:sec" -> state
+  secState: {},       // "pack:sec" -> state (also "inf:pack:npc" for influence trackers)
+  hist: {},           // "pack:sec" -> { at, damaged: [creatureIds] } from the last finished fight
   ui: { sel: null, tab: "creature", modal: null, lastRoll: null, glossQ: "", turnNotes: null },
   persisted: false,
 };
@@ -66,6 +67,12 @@ function crOf(c) {
   if (c.custom) return c.custom;
   const p = S.enc && pack(S.enc.packId); return p ? p.creatures[c.creatureId] : null;
 }
+// Short display name for tight places (turn order, roll card): swap the creature's full name for its pack short name.
+function shortName(c) {
+  const cr = crOf(c);
+  if (!cr || !cr.short || !c.name) return c.name;
+  return c.name.startsWith(cr.name) ? cr.short + c.name.slice(cr.name.length) : c.name;
+}
 function sectionOf(packId, secId) { const p = pack(packId); return p ? p.sections.find(s => s.id === secId) : null; }
 function refText(key, packId) {
   if (key.startsWith("cond:")) { const c = COND_BY_NAME[key.slice(5)]; return c ? { name: c.name, kind: "condition", text: c.text, source: "Player Core, Conditions Appendix" } : null; }
@@ -107,6 +114,7 @@ function render() {
     if (r.name === "library") html = viewLibrary();
     else if (r.name === "pack") html = viewPack(r.a);
     else if (r.name === "section") html = viewSection(r.a, r.b);
+    else if (r.name === "influence") html = viewInfluenceNpc(r.a, r.b);
     else if (r.name === "setup") html = viewSetup();
     else if (r.name === "combat") html = viewCombat();
     else if (r.name === "glossary") html = viewGlossary();
@@ -117,6 +125,7 @@ function render() {
     html = `<div class="page"><div class="panel warn">Something went wrong drawing this screen: ${esc(e.message)}. Your data is safe. <button data-act="go" data-href="#library">Back to library</button></div></div>`;
   }
   $app().innerHTML = html;
+  S.ui.scrollQuietUntil = Date.now() + 400; // restoring scroll position isn't a user scroll
   for (const [k, top] of scrolls) { const el = document.querySelector(`[data-keep-scroll="${k}"]`); if (el) el.scrollTop = top; }
   renderModal();
   wakeLock(r.name === "combat" && S.settings.keepAwake);
@@ -153,14 +162,14 @@ function viewLibrary() {
     <p class="muted small">Version ${APP_VERSION} · ${S.persisted ? "Storage is persistent" : "Storage may be cleared by the browser if space runs low — export a backup in Settings"}${navigator.onLine ? "" : " · Offline"}</p>
   </main>`;
 }
-const KIND_LABEL = { combat: "Combat", social: "Social", chase: "Chase", exploration: "Exploration", scene: "Scene", hazard: "Hazard" };
+const KIND_LABEL = { combat: "Combat", social: "Social", chase: "Chase", exploration: "Exploration", scene: "Tracker", hazard: "Hazard", npcs: "NPCs", influence: "Influence" };
 function viewPack(id) {
   const p = pack(id); if (!p) return `${topbar("Pack not found", { back: "#library" })}`;
   return `${topbar(esc(p.chapter), { back: "#library", right: `<button class="danger" data-act="delPack" data-id="${esc(p.id)}">Remove pack</button>` })}
   <main class="page">
     ${resumeBanner()}
     <ol class="seclist">${p.sections.map((s, i) => `
-      <li><button data-act="go" data-href="#section/${encodeURIComponent(p.id)}/${encodeURIComponent(s.id)}">
+      <li><button ${s.kind === "combat" ? `data-act="quickSetup" data-pack="${esc(p.id)}" data-sec="${esc(s.id)}"` : `data-act="go" data-href="#section/${encodeURIComponent(p.id)}/${encodeURIComponent(s.id)}"`}>
         <span class="num">${i + 1}</span>
         <span class="t">${esc(s.title)}</span>
         <span class="kind k-${s.kind}">${KIND_LABEL[s.kind] || s.kind}</span>
@@ -189,26 +198,24 @@ function counterHtml(label, val, max, act, extra = "") {
     <span class="val">${val}${max != null ? `<small>/${max}</small>` : ""}</span>
     <button class="stepbtn" data-act="${act}" data-d="1" ${extra}>+</button></div>`;
 }
-function npcCard(n, packId, secId) {
-  const inf = n.influence;
-  return `<article class="npc">
-    <header><h3>${esc(n.name)}</h3><span class="muted">${esc(n.descriptor)}</span></header>
-    <div class="npc-grid">
+function npcBody(n) {
+  return `<div class="npc-grid">
       <section class="wants"><h4>Wants</h4><ul>${(n.wants || []).map(w => `<li>${fmt(w)}</li>`).join("")}</ul></section>
       <section><h4>Knows</h4><ul>${(n.knows || []).map(w => `<li>${fmt(w)}</li>`).join("")}</ul></section>
     </div>
     ${n.personality ? `<p><b>Personality:</b> ${fmt(n.personality)}</p>` : ""}
-    ${n.attitude ? `<p><b>Starting attitude:</b> ${fmt(n.attitude)}</p>` : ""}
+    ${n.attitude ? `<p><b>Attitude:</b> ${fmt(n.attitude)}</p>` : ""}
     ${n.tips && n.tips.length ? `<ul class="tips">${n.tips.map(t => `<li>${fmt(t)}</li>`).join("")}</ul>` : ""}
-    ${inf ? `<div class="influence">
-      <h4>Influence · Perception +${inf.perception} · Will +${inf.will} · ${inf.rounds} rounds</h4>
-      <p><b>Discovery</b> ${fmt(inf.discovery)}</p>
-      <table class="inftab"><tbody>${inf.skills.map(s => `<tr><td class="dc">DC ${s.dc}</td><td>${fmt(s.skill)}${s.note ? ` <span class="muted">— ${fmt(s.note)}</span>` : ""}</td></tr>`).join("")}</tbody></table>
-      <ul class="thresh">${inf.thresholds.map(t => `<li><b>${t.points}</b> ${fmt(t.text)}</li>`).join("")}</ul>
-      <p><b>Resistances</b> ${fmt(inf.resistances)}</p>
-      <p><b>Weaknesses</b> ${fmt(inf.weaknesses)}</p>
-    </div>` : ""}
-  </article>`;
+    ${n.bookNote ? `<p class="booknote">${fmt(n.bookNote)}</p>` : ""}`;
+}
+// One collapsible card per NPC. Influence NPCs get a button into the tracker.
+function npcCard(n, packId, key, { open = false } = {}) {
+  const ok = "npc:" + packId + ":" + (key || n.name);
+  return `<details class="npc" data-keep-open="${esc(ok)}" ${open || isOpen(ok) ? "open" : ""}>
+    <summary><span class="npcname">${esc(n.name)}</span><span class="muted small">${esc(n.descriptor)}</span>${n.where ? `<span class="where small">${esc(n.where)}</span>` : ""}</summary>
+    ${npcBody(n)}
+    ${n.influence && key ? `<div class="row"><button class="primary" data-act="go" data-href="#influence/${encodeURIComponent(packId)}/${encodeURIComponent(key)}">Run influence encounter ›</button>${n.influence.optional ? `<span class="muted small">Optional; not tied to a scene</span>` : ""}</div>` : ""}
+  </details>`;
 }
 function refChips(keys, packId) {
   const ks = [...new Set(keys)].filter(k => refText(k, packId));
@@ -218,10 +225,12 @@ function refChips(keys, packId) {
 function viewSection(packId, secId) {
   const p = pack(packId), s = sectionOf(packId, secId);
   if (!p || !s) return topbar("Not found", { back: "#library" });
+  if (s.kind === "influence") return viewInfluence(packId, s.npc, s, `#pack/${encodeURIComponent(packId)}`);
   const st = secState(packId, s);
   const five = S.settings.partySize >= 5;
   let body = "";
   body += `<p class="lead">${fmt(s.summary)}</p>`;
+  if (s.kind === "npcs") body += (s.npcs || []).map(k => npcCard(p.npcs[k], packId, k)).join("");
   if (s.kind === "combat") {
     const v = s.variants.find(x => x.id === st.variant) || s.variants[0];
     body += `<div class="panel startbox">
@@ -233,7 +242,7 @@ function viewSection(packId, secId) {
     </div>`;
   } else if (s.scaling && five) body += `<p class="scaling"><b>5 players:</b> ${fmt(s.scaling)}</p>`;
   if (s.counters && s.counters.length) body += `<div class="counters">${s.counters.map((c, i) => counterHtml(c.label, st.counters[i], c.max, "secCounter", `data-i="${i}" data-pack="${esc(packId)}" data-sec="${esc(secId)}"`)).join("")}</div>`;
-  if (s.npcs) body += s.npcs.map(n => npcCard(p.npcs[n], packId, secId)).join("");
+  if (s.npcs && s.kind !== "npcs") body += s.npcs.map(k => npcCard(p.npcs[k], packId, k)).join("");
   if (s.obstacles) {
     const need = o => five ? (o.points5 || o.points) : o.points;
     body += `<div class="panel chase">
@@ -263,6 +272,195 @@ function viewSection(packId, secId) {
 function partySeg() {
   return `<span class="muted">Players</span><div class="seg">${[4, 5].map(n => `<button aria-pressed="${S.settings.partySize === n}" data-act="partySize" data-n="${n}">${n}</button>`).join("")}</div>`;
 }
+
+/* ---------------------------------------------------------- influence */
+const RES = { cs: { label: "Critical success", pts: 2 }, s: { label: "Success", pts: 1 }, f: { label: "Failure", pts: 0 }, cf: { label: "Critical failure", pts: -1 } };
+function infKey(packId, npcKey) { return `inf:${packId}:${npcKey}`; }
+function infState(packId, npcKey) {
+  const k = infKey(packId, npcKey);
+  if (!S.secState[k]) S.secState[k] = { start: null, round: 1, points: 0, acted: {}, known: [], on: {}, used: {}, perPc: {}, reached: [], log: [], ended: null, pick: null, banner: null };
+  return S.secState[k];
+}
+function infSave(packId, npcKey) { kv.set("sec:" + infKey(packId, npcKey), S.secState[infKey(packId, npcKey)]); }
+function infParty() {
+  if (S.settings.party.length) return S.settings.party.map(p => ({ key: p.id, name: p.name }));
+  return Array.from({ length: S.settings.partySize || 4 }, (_, i) => ({ key: "pc" + (i + 1), name: `PC ${i + 1}` }));
+}
+// Which starting option the book's condition points to, from the last finished fight in the named section.
+function infAutoStart(packId, inf) {
+  for (const st of inf.starts || []) {
+    const a = st.autoIf; if (!a) continue;
+    const h = S.hist[secKey(packId, a.section)];
+    if (h && (h.damaged || []).includes(a.damaged)) return { id: st.id, why: `Your last ${sectionOf(packId, a.section) ? sectionOf(packId, a.section).title : a.section} fight damaged a ${pack(packId).creatures[a.damaged] ? pack(packId).creatures[a.damaged].name.toLowerCase() : a.damaged}.` };
+  }
+  return null;
+}
+function infRounds(inf, st) { const s0 = (inf.starts || []).find(x => x.id === st.start); return s0 ? s0.rounds : null; }
+function infDcAll(inf, st) { return (inf.resistances || []).concat(inf.weaknesses || []).filter(e => e.scope === "all" && e.dc && st.on[e.id]).reduce((a, e) => a + e.dc, 0); }
+function infPcEffects(inf) { return (inf.resistances || []).concat(inf.weaknesses || []).filter(e => e.scope === "pc"); }
+function infTop(inf) { return Math.max(...inf.thresholds.map(t => t.points)); }
+function infOutcome(inf, pts) {
+  if (inf.outcomes && inf.outcomes.length) { const o = inf.outcomes.slice().sort((a, b) => b.min - a.min); return (o.find(x => pts >= x.min) || o[o.length - 1]).text; }
+  const t = inf.thresholds.filter(x => pts >= x.points).sort((a, b) => b.points - a.points)[0];
+  return t ? t.text : "No threshold reached.";
+}
+function infLog(st, text) { st.log.push({ r: st.round, text }); if (st.log.length > 200) st.log.shift(); }
+function infChangePoints(inf, st, d) {
+  st.points += d;
+  const newly = inf.thresholds.filter(t => st.points >= t.points && !st.reached.includes(t.points));
+  for (const t of newly) st.reached.push(t.points);
+  if (newly.length) st.banner = newly.map(t => t.points);
+  if (st.points >= infTop(inf) && !st.ended) { st.ended = "top"; infLog(st, `Reached ${infTop(inf)} Influence Points`); }
+}
+// Discover: options the party can still learn. Skills come in ascending DC, one at a time ("lowest DC they don't know").
+function infDiscoverOptions(inf, st) {
+  const opts = [];
+  const sk = inf.skills.slice().sort((a, b) => a.dc - b.dc).find(x => !st.known.includes(x.id));
+  if (sk) opts.push({ id: sk.id, kind: "Best skill they don't know", text: `${sk.skill} (DC ${sk.dc})` });
+  for (const e of inf.resistances || []) if (!st.known.includes(e.id)) opts.push({ id: e.id, kind: "Resistance", text: e.text });
+  for (const e of inf.weaknesses || []) if (!st.known.includes(e.id)) opts.push({ id: e.id, kind: "Weakness", text: e.text });
+  return opts;
+}
+function infFalseClue(inf) {
+  const sk = inf.skills.slice().sort((a, b) => b.dc - a.dc)[0];
+  const r = (inf.resistances || [])[0];
+  return [sk ? `Tell them ${sk.skill} is the best way to win them over (it's actually the hardest, DC ${sk.dc}).` : "", r ? `Or present a resistance as a weakness: “${r.label}” would help, not hurt.` : ""].filter(Boolean);
+}
+function infAllActed(st, party) { return party.every(pc => st.acted[pc.key]); }
+function infAdvance(inf, st, party) {
+  if (st.ended || !infAllActed(st, party)) return;
+  const rounds = infRounds(inf, st);
+  if (rounds != null && st.round >= rounds) { st.ended = "rounds"; infLog(st, `Out of rounds (${rounds})`); return; }
+  st.round++; st.acted = {}; infLog(st, `— Round ${st.round} —`);
+}
+
+function viewInfluenceNpc(packId, npcKey) {
+  const p = pack(packId); const n = p && p.npcs[npcKey];
+  if (!n || !n.influence) return topbar("Not found", { back: "#library" });
+  const npcSec = p.sections.find(x => x.kind === "npcs");
+  return viewInfluence(packId, npcKey, null, npcSec ? `#section/${encodeURIComponent(packId)}/${encodeURIComponent(npcSec.id)}` : `#pack/${encodeURIComponent(packId)}`);
+}
+function viewInfluence(packId, npcKey, sec, back) {
+  const p = pack(packId); const n = p.npcs[npcKey]; const inf = n.influence;
+  const st = infState(packId, npcKey); const party = infParty();
+  const a = `data-pack="${esc(packId)}" data-npc="${esc(npcKey)}"`;
+  const title = sec ? sec.title : `${n.name}: influence`;
+  let body = "";
+  if (!st.start) {
+    if (sec) body += `<p class="lead">${fmt(sec.summary)}</p>`;
+    if (sec && sec.scaling && S.settings.partySize >= 5) body += `<p class="scaling"><b>5 players:</b> ${fmt(sec.scaling)}</p>`;
+    const auto = infAutoStart(packId, inf);
+    body += `<div class="panel infstart"><h3>How does ${esc(n.name.split(" ")[0])} start?</h3>
+      ${auto ? `<p class="muted small">Suggested: ${esc(auto.why)}</p>` : ""}
+      <div class="startopts">${(inf.starts || [{ id: "go", label: "Start", rounds: null, text: "" }]).map(o => `<button class="startopt ${auto && auto.id === o.id ? "sugg" : ""}" data-act="infStart" ${a} data-id="${esc(o.id)}">
+        <b>${esc(o.label)}${o.rounds ? ` · ${o.rounds} rounds` : ""}</b><span class="small">${fmt(o.text || "", { link: false })}</span></button>`).join("")}</div>
+      <p class="muted small">Players roll openly; you tap each result.</p></div>`;
+  } else {
+    const rounds = infRounds(inf, st); const top = infTop(inf); const dcAll = infDcAll(inf, st);
+    const pct = v => Math.max(0, Math.min(100, (v / top) * 100));
+    body += `<div class="panel infbar">
+      <div class="row between"><div class="infround">${st.ended ? "Ended" : `Round <b>${st.round}</b>${rounds ? ` of ${rounds}` : ""}`}</div>
+        <div class="infpts"><b>${st.points}</b><small> / ${top} Influence Points</small></div>
+        <div class="row"><button data-act="infUndo" ${a} ${(S.ui.infUndo && S.ui.infUndo[infKey(packId, npcKey)] || []).length ? "" : "disabled"}>↶ Undo</button><button data-act="infReset" ${a}>Start over</button></div></div>
+      <div class="track"><i style="width:${pct(st.points)}%"></i>${inf.thresholds.filter(t => t.points > 0).map(t => `<span class="tick ${st.reached.includes(t.points) ? "hit" : ""}" style="left:${pct(t.points)}%">${t.points}</span>`).join("")}</div>
+    </div>`;
+    if (st.banner && st.banner.length && !st.ended) body += `<div class="panel hint infbanner"><button class="x" data-act="infBannerX" ${a} aria-label="Dismiss">×</button>${inf.thresholds.filter(t => st.banner.includes(t.points)).map(t => `<p><b>Influence ${t.points}:</b> ${fmt(t.text)}</p>`).join("")}</div>`;
+    if (st.ended) {
+      const why = { top: `Reached ${top} points.`, rounds: "Out of rounds.", hostile: `${esc(n.name.split(" ")[0])} turned hostile.`, penalty: "The meeting was cut short.", manual: "Ended early." }[st.ended] || "";
+      body += `<div class="panel outcome"><h3>Outcome · ${st.points} point${st.points === 1 ? "" : "s"}</h3><p class="muted small">${why}</p>
+        ${st.ended === "hostile" && inf.hostile ? `<p>${fmt(inf.hostile.text)}</p><button class="primary big" data-act="newSetup" data-pack="${esc(packId)}" data-sec="${esc(inf.hostile.section)}" data-variant="${esc(inf.hostile.variant)}">Set up the fight ›</button>`
+          : st.ended === "penalty" && inf.penalty ? `<p>${fmt(inf.penalty.text)}</p>` : `<p>${fmt(infOutcome(inf, st.points))}</p>`}
+        ${inf.after && st.ended !== "hostile" ? `<ul class="notes">${inf.after.map(x => `<li>${fmt(x)}</li>`).join("")}</ul>` : ""}</div>`;
+    }
+    // party rows
+    const pcEff = infPcEffects(inf);
+    const rows = party.map(pc => {
+      const done = st.acted[pc.key]; const picking = st.pick && st.pick.pc === pc.key;
+      const effs = pcEff.map(e => `<button class="chip ${st.perPc[pc.key] && st.perPc[pc.key][e.id] ? "on" : ""}" aria-pressed="${!!(st.perPc[pc.key] && st.perPc[pc.key][e.id])}" data-act="infPcEff" ${a} data-pc="${esc(pc.key)}" data-id="${esc(e.id)}">${esc(e.short || e.label)}${e.bonus ? ` +${e.bonus}` : ""}${e.dc ? ` (DCs +${e.dc})` : ""}</button>`).join("");
+      let right = "";
+      if (st.ended) right = done ? `<span class="muted small">${esc(done.text)}</span>` : "";
+      else if (picking && st.pick.stage === "result") right = `<div class="seg small resseg">${Object.entries(RES).map(([k, r]) => `<button data-act="infResult" ${a} data-pc="${esc(pc.key)}" data-r="${k}">${r.label}${st.pick.act === "inf" ? ` <small>${r.pts > 0 ? "+" : ""}${r.pts}</small>` : ""}</button>`).join("")}<button data-act="infCancel" ${a}>Cancel</button></div>`;
+      else if (picking && st.pick.stage === "reveal") {
+        const opts = infDiscoverOptions(inf, st);
+        right = `<div class="reveal"><span class="small"><b>${st.pick.left === 2 ? "Critical success: pick two" : "Pick one"}</b> to tell them${st.pick.left === 1 && st.pick.crit ? " (one more)" : ""}:</span>
+          ${opts.length ? opts.map(o => `<button class="revopt" data-act="infReveal" ${a} data-id="${esc(o.id)}"><span class="muted small">${esc(o.kind)}</span> ${fmt(o.text, { link: false })}</button>`).join("") : `<span class="muted small">They already know everything listed.</span>`}
+          <button data-act="infRevealDone" ${a}>Done</button></div>`;
+      } else if (picking && st.pick.stage === "false") right = `<div class="reveal"><span class="small"><b>Critical failure:</b> give them a wrong clue, for example:</span><ul class="small">${infFalseClue(inf).map(x => `<li>${esc(x)}</li>`).join("")}</ul><button data-act="infRevealDone" ${a}>Done</button></div>`;
+      else if (done) right = `<span class="acted">${esc(done.text)}</span>`;
+      else right = `<button data-act="infAct" ${a} data-pc="${esc(pc.key)}" data-k="inf">Influence</button><button data-act="infAct" ${a} data-pc="${esc(pc.key)}" data-k="disc">Discover</button>`;
+      return `<li class="infpc ${done ? "done" : ""} ${picking ? "picking" : ""}"><span class="pcn"><b>${esc(pc.name)}</b>${effs ? `<span class="effs">${effs}</span>` : ""}</span><span class="pcr">${right}</span></li>`;
+    }).join("");
+    const once = (inf.weaknesses || []).concat(inf.resistances || []).filter(e => e.once);
+    const alls = (inf.resistances || []).concat(inf.weaknesses || []).filter(e => e.scope === "all");
+    if (!st.ended) body += `<div class="infgrid">
+      <section class="panel"><div class="row between"><h3>Party</h3>${st.ended ? "" : `<button data-act="infNextRound" ${a}>${rounds && st.round >= rounds ? "End encounter" : "Next round ›"}</button>`}</div>
+        ${S.settings.party.length ? "" : `<p class="muted small">Add your players in Settings to see their names here.</p>`}
+        <ul class="infparty">${rows}</ul>
+        ${st.ended ? "" : `<div class="row infacts">
+          ${once.map(e => `<button ${st.used[e.id] ? "disabled" : ""} data-act="infOnce" ${a} data-id="${esc(e.id)}">${esc(e.label)}${st.used[e.id] ? " (used)" : ` +${e.points}`}</button>`).join("")}
+          ${alls.map(e => `<button aria-pressed="${!!st.on[e.id]}" data-act="infToggle" ${a} data-id="${esc(e.id)}">${esc(e.label)}${e.dc ? ` (DCs +${e.dc})` : ""}</button>`).join("")}
+          ${inf.hostile ? `<button class="danger" data-act="infEnd" ${a} data-why="hostile">${esc(inf.hostile.label)}</button>` : ""}
+          ${inf.penalty ? `<button class="danger" data-act="infEnd" ${a} data-why="penalty">${esc(inf.penalty.label)}</button>` : ""}
+          <button data-act="infEnd" ${a} data-why="manual">End now</button></div>`}
+      </section>
+      <section class="panel infref">
+        <h4>Influence skills</h4><table class="inftab"><tbody>${inf.skills.slice().sort((x, y) => x.dc - y.dc).map(sk => `<tr><td class="dc ${dcAll ? "adj" : ""}">DC ${sk.dc + dcAll}</td><td>${fmt(sk.skill)}${sk.note ? ` <span class="muted">— ${fmt(sk.note)}</span>` : ""}${st.known.includes(sk.id) ? ` <span class="badge known">known</span>` : ""}</td></tr>`).join("")}</tbody></table>
+        <p class="small"><b>Discover</b> ${inf.discovery.map(d => `DC ${d.dc} ${esc(d.skill)}`).join(", ")} · <span class="muted">Perception +${inf.perception} · Will +${inf.will}</span></p>
+        ${(inf.resistances || []).map(e => `<p class="small"><b>Resistance</b> ${fmt(e.text)}${st.known.includes(e.id) ? ` <span class="badge known">known</span>` : ""}</p>`).join("")}
+        ${(inf.weaknesses || []).map(e => `<p class="small"><b>Weakness</b> ${fmt(e.text)}${st.known.includes(e.id) ? ` <span class="badge known">known</span>` : ""}</p>`).join("")}
+        <h4>Thresholds</h4><ul class="thresh">${inf.thresholds.map(t => `<li class="${st.reached.includes(t.points) ? "hit" : ""}"><b>${t.points}</b> ${fmt(t.text)}</li>`).join("")}</ul>
+      </section></div>`;
+    if (st.log.length) body += `<details class="rulesbox" data-keep-open="inflog" ${isOpen("inflog") ? "open" : ""}><summary>Log ▸</summary><ul class="log small">${st.log.slice().reverse().map(x => `<li><span class="muted">R${x.r}</span> ${esc(x.text)}</li>`).join("")}</ul></details>`;
+  }
+  body += npcCard(n, packId, null);
+  if (sec && sec.refs) body += refChips(sec.refs, packId);
+  else body += refChips(["discover", "influence"], packId);
+  return `${topbar(esc(title), { back })}<main class="page infpage">${resumeBanner()}${body}</main>`;
+}
+function infCtx(el) {
+  const packId = el.dataset.pack, npcKey = el.dataset.npc; const inf = pack(packId).npcs[npcKey].influence;
+  return { packId, npcKey, inf, st: infState(packId, npcKey), party: infParty() };
+}
+function infMut(el, fn) {
+  const c = infCtx(el); const k = infKey(c.packId, c.npcKey);
+  S.ui.infUndo = S.ui.infUndo || {}; (S.ui.infUndo[k] = S.ui.infUndo[k] || []).push(JSON.stringify(c.st));
+  if (S.ui.infUndo[k].length > 60) S.ui.infUndo[k].shift();
+  fn(c); infSave(c.packId, c.npcKey); render();
+}
+const INF_ACTIONS = {
+  infStart: el => infMut(el, ({ st, inf }) => { st.start = el.dataset.id; const o = (inf.starts || []).find(x => x.id === st.start); infLog(st, `Started: ${o ? o.label : "go"}`); const t0 = inf.thresholds.filter(t => t.points <= 0); for (const t of t0) st.reached.push(t.points); if (t0.length) st.banner = t0.map(t => t.points); }),
+  infAct: el => infMut(el, ({ st }) => { st.pick = { pc: el.dataset.pc, act: el.dataset.k, stage: "result" }; }),
+  infCancel: el => infMut(el, ({ st }) => { st.pick = null; }),
+  infResult: el => infMut(el, ({ st, inf, party }) => {
+    const pc = party.find(x => x.key === el.dataset.pc); const r = RES[el.dataset.r]; const act = st.pick.act; st.banner = null;
+    if (act === "inf") {
+      st.acted[pc.key] = { act, res: el.dataset.r, text: `Influence: ${r.label}${r.pts ? ` (${r.pts > 0 ? "+" : ""}${r.pts})` : ""}` };
+      infLog(st, `${pc.name} Influence: ${r.label}${r.pts ? ` (${r.pts > 0 ? "+" : ""}${r.pts})` : ""}`);
+      st.pick = null; if (r.pts) infChangePoints(inf, st, r.pts); infAdvance(inf, st, party);
+    } else {
+      st.acted[pc.key] = { act, res: el.dataset.r, text: `Discover: ${r.label}` };
+      infLog(st, `${pc.name} Discover: ${r.label}`);
+      if (el.dataset.r === "cs") st.pick = { pc: pc.key, act, stage: "reveal", left: 2, crit: true };
+      else if (el.dataset.r === "s") st.pick = { pc: pc.key, act, stage: "reveal", left: 1 };
+      else if (el.dataset.r === "cf") st.pick = { pc: pc.key, act, stage: "false" };
+      else { st.pick = null; infAdvance(inf, st, party); }
+    }
+  }),
+  infReveal: el => infMut(el, ({ st, inf, party }) => {
+    const opt = infDiscoverOptions(inf, st).find(o => o.id === el.dataset.id); if (!opt) return;
+    st.known.push(opt.id); infLog(st, `Told them (${opt.kind.toLowerCase()}): ${opt.text.replace(/\*\*/g, "")}`);
+    st.pick.left--; if (st.pick.left <= 0) { st.pick = null; infAdvance(inf, st, party); }
+  }),
+  infRevealDone: el => infMut(el, ({ st, inf, party }) => { st.pick = null; infAdvance(inf, st, party); }),
+  infNextRound: el => infMut(el, ({ st, inf, party }) => { for (const pc of party) if (!st.acted[pc.key]) st.acted[pc.key] = { act: "skip", text: "Didn't act" }; st.pick = null; infAdvance(inf, st, party); }),
+  infOnce: el => infMut(el, ({ st, inf }) => { const e = (inf.weaknesses || []).concat(inf.resistances || []).find(x => x.id === el.dataset.id); st.used[e.id] = true; st.banner = null; infLog(st, `${e.label}: ${e.points > 0 ? "+" : ""}${e.points}`); infChangePoints(inf, st, e.points); }),
+  infToggle: el => infMut(el, ({ st, inf }) => { const id = el.dataset.id; st.on[id] = !st.on[id]; const e = (inf.resistances || []).concat(inf.weaknesses || []).find(x => x.id === id); infLog(st, `${e.label}: ${st.on[id] ? "on" : "off"}`); }),
+  infPcEff: el => infMut(el, ({ st, party }) => { const m = st.perPc[el.dataset.pc] = st.perPc[el.dataset.pc] || {}; m[el.dataset.id] = !m[el.dataset.id]; }),
+  infEnd: el => infMut(el, ({ st }) => { st.ended = el.dataset.why; st.pick = null; infLog(st, `Ended: ${el.dataset.why}`); }),
+  infBannerX: el => infMut(el, ({ st }) => { st.banner = null; }),
+  infUndo: el => { const c = infCtx(el); const k = infKey(c.packId, c.npcKey); const u = S.ui.infUndo && S.ui.infUndo[k]; if (!u || !u.length) return; S.secState[k] = JSON.parse(u.pop()); infSave(c.packId, c.npcKey); render(); },
+  infReset: el => { const c = infCtx(el); openModal({ type: "confirm", title: "Start this influence encounter over?", text: "Points, rounds and what the party learned are cleared.", yes: "Start over", danger: true, then: () => { delete S.secState[infKey(c.packId, c.npcKey)]; kv.del("sec:" + infKey(c.packId, c.npcKey)); if (S.ui.infUndo) delete S.ui.infUndo[infKey(c.packId, c.npcKey)]; render(); } }); },
+};
 
 /* -------------------------------------------------------------- setup */
 function buildSetup(packId, secId, variantId) {
@@ -332,9 +530,17 @@ function viewSetup() {
   if (!st) return `${topbar("Encounter setup", { back: "#library" })}<main class="page"><div class="empty">Pick an encounter from a pack first.</div></main>`;
   const p = pack(st.packId), s = sectionOf(st.packId, st.secId);
   const v = s.variants.find(x => x.id === st.variantId);
+  const notes = [...new Set(st.rows.filter(r => !p.creatures[r.creatureId].simple).map(r => r.initNote || ""))];
+  const sharedNote = notes.length === 1 && notes[0] ? notes[0] : "";
   const missing = st.rows.filter(r => r.init == null && !p.creatures[r.creatureId].simple).length + st.pcs.filter(r => r.include && r.init == null).length;
-  return `${topbar(`Set up: ${esc(s.title)}`, { back: `#section/${encodeURIComponent(st.packId)}/${encodeURIComponent(st.secId)}` })}
+  const lootPrev = lootHtml(st.packId, s, st.rows.map(r => ({ creatureId: r.creatureId, name: rowName(r), defeated: true })), { preview: true });
+  return `${topbar(`Set up: ${esc(s.title)}${s.tag ? ` <span class="tag">${esc(s.tag)}</span>` : ""}`, { back: `#pack/${encodeURIComponent(st.packId)}` })}
   <main class="page setup">
+    <p class="lead">${fmt(s.summary)}</p>
+    ${(s.notes && s.notes.length) || lootPrev || s.bookNote ? `<details class="rulesbox setupnotes" data-keep-open="setupnotes" ${isOpen("setupnotes") ? "open" : ""}><summary>Encounter notes${lootPrev ? " & loot" : ""} ▸</summary>
+      ${s.notes && s.notes.length ? `<ul class="notes">${s.notes.map(n => `<li>${fmt(n)}</li>`).join("")}</ul>` : ""}
+      ${lootPrev}
+      ${s.bookNote ? `<p class="booknote">${fmt(s.bookNote)}</p>` : ""}</details>` : ""}
     <div class="row between">
       <div class="row">${s.variants.length > 1 ? `<div class="seg">${s.variants.map(x => `<button aria-pressed="${x.id === st.variantId}" data-act="setupVariant" data-id="${esc(x.id)}">${esc(x.label)}</button>`).join("")}</div>` : ""}
       ${partySeg()}</div>
@@ -343,11 +549,11 @@ function viewSetup() {
     ${st.partySize >= 5 ? `<p class="scaling"><b>5 players:</b> ${fmt(v.scaling)}</p>` : ""}
     <div class="setup-grid">
       <section class="panel"><h3>Enemies & hazards</h3>
-        <table class="inittab"><thead><tr><th></th><th>Name</th><th>Initiative</th><th></th><th>Result</th><th></th></tr></thead><tbody>
+        <table class="inittab"><thead><tr><th></th><th>Name</th><th>Initiative${sharedNote ? ` <span class="muted">(${esc(sharedNote)})</span>` : ""}</th><th></th><th>Result</th><th></th></tr></thead><tbody>
         ${st.rows.map(r => `<tr>
           <td>${r.kind === "hazard" ? `<span class="chipc hz">HZ</span>` : `<button class="chipc" style="background:${r.color || "transparent"};color:${textOn(r.color)}" data-act="cycleColor" data-uid="${r.uid}" aria-label="Change color">${r.color ? "" : "—"}</button>`}</td>
-          <td><b>${esc(rowName(r))}</b>${r.joinsRound ? ` <span class="badge">joins round ${r.joinsRound}</span>` : ""}${r.startConditions.length ? ` <span class="badge">${r.startConditions.map(c => esc(c.name + (c.value ? " " + c.value : ""))).join(", ")}</span>` : ""}</td>
-          <td>${esc(r.initSkill)} ${sgn(r.initMod)}${r.initNote ? ` <span class="muted small">(${esc(r.initNote)})</span>` : ""}</td>
+          <td><b>${esc((p.creatures[r.creatureId].short ? rowName(r).replace(r.baseName, p.creatures[r.creatureId].short) : rowName(r)))}</b>${r.joinsRound ? ` <span class="badge">joins round ${r.joinsRound}</span>` : ""}${r.startConditions.length ? ` <span class="badge">${r.startConditions.map(c => esc(c.name + (c.value ? " " + c.value : ""))).join(", ")}</span>` : ""}</td>
+          <td>${esc(r.initSkill)} ${sgn(r.initMod)}${r.initNote && r.initNote !== sharedNote ? ` <span class="muted small">(${esc(r.initNote)})</span>` : ""}</td>
           ${p.creatures[r.creatureId].simple ? `<td></td><td class="muted small">no turn</td>` : `<td><button data-act="rollInit" data-uid="${r.uid}">🎲</button></td>
           <td><input type="number" inputmode="numeric" class="initin" value="${r.init ?? ""}" data-in="setInit" data-uid="${r.uid}"></td>`}
           <td><button class="mini x" data-act="setupRemove" data-uid="${r.uid}" aria-label="Remove">×</button></td>
@@ -550,9 +756,9 @@ function viewCombat() {
       <span class="grip" data-grip="${c.uid}" aria-label="Drag to reorder">⋮⋮</span>
       ${c.noTurn ? `<span class="init blank"></span>` : `<button class="init" data-act="editInit" data-uid="${c.uid}" aria-label="Edit initiative">${c.init}</button>`}
       ${colorDot(c)}
-      <span class="cname"><b>${esc(c.name)}</b><span class="cconds">${condChips(c)}</span></span>
-      <span class="cstats">${c.hp != null ? `<span class="hpn">${c.hp}${c.temp ? `<small>+${c.temp}</small>` : ""}<small>/${c.maxHp}</small></span>${hpBar(c)}` : ""}
-        ${ac != null ? `<span class="acn ${acR.delta ? "adj" : ""}">AC ${ac}</span>` : ""}
+      <span class="cname"><b>${esc(shortName(c))}</b><span class="cconds">${condChips(c)}</span></span>
+      <span class="cstats"><span class="cst1">${c.hp != null ? `<span class="hpn">${c.hp}${c.temp ? `<small>+${c.temp}</small>` : ""}<small>/${c.maxHp}</small></span>` : ""}${ac != null ? `<span class="acn ${acR.delta ? "adj" : ""}">AC ${ac}</span>` : ""}</span>
+        ${c.hp != null ? hpBar(c) : ""}
         ${(c.counters || []).map(ct => `<span class="ctn">${esc(ct.label.split(" ")[0])} ${ct.val}</span>`).join("")}</span>
     </li>`;
   };
@@ -571,15 +777,15 @@ function viewCombat() {
     <div class="panes">
       <section class="pane-left" data-keep-scroll="left">
         <ol class="order" id="mainOrder">${main.map(row).join("")}</ol>
-        ${delayed.length ? `<h4 class="subh">Delaying</h4><ol class="order">${delayed.map(c => `<li class="crow delayed" data-act="sel" data-uid="${c.uid}">${colorDot(c)}<span class="cname"><b>${esc(c.name)}</b></span><button class="primary" data-act="undelay" data-uid="${c.uid}">Act now</button></li>`).join("")}</ol>` : ""}
+        ${delayed.length ? `<h4 class="subh">Delaying</h4><ol class="order">${delayed.map(c => `<li class="crow delayed" data-act="sel" data-uid="${c.uid}">${colorDot(c)}<span class="cname"><b>${esc(shortName(c))}</b></span><button class="primary" data-act="undelay" data-uid="${c.uid}">Act now</button></li>`).join("")}</ol>` : ""}
         ${noturn.length ? `<h4 class="subh">Hazards & objects (no turn)</h4><ol class="order">${noturn.map(c => row(c).replace('<span class="grip"', '<span class="grip hidden"')).join("")}</ol>` : ""}
-        ${waiting.length ? `<h4 class="subh">Joining later</h4><ol class="order">${waiting.map(c => `<li class="crow waiting ${c.uid === S.ui.sel ? "sel" : ""}" data-act="sel" data-uid="${c.uid}"><span class="init">${c.init}</span>${colorDot(c)}<span class="cname"><b>${esc(c.name)}</b><span class="muted small">joins round ${c.joinsRound}</span></span><button data-act="joinNow" data-uid="${c.uid}">Join now</button></li>`).join("")}</ol>` : ""}
+        ${waiting.length ? `<h4 class="subh">Joining later</h4><ol class="order">${waiting.map(c => `<li class="crow waiting ${c.uid === S.ui.sel ? "sel" : ""}" data-act="sel" data-uid="${c.uid}"><span class="init">${c.init}</span>${colorDot(c)}<span class="cname"><b>${esc(shortName(c))}</b><span class="muted small">joins round ${c.joinsRound}</span></span><button data-act="joinNow" data-uid="${c.uid}">Join now</button></li>`).join("")}</ol>` : ""}
         <div class="leftfoot"><button data-act="addCombatant">+ Add combatant</button></div>
       </section>
       <section class="pane-right">
         <nav class="tabs">${[["creature", "Combatant"], ["notes", "Encounter notes"], ["log", "Log"]].map(([k, l]) => `<button aria-pressed="${S.ui.tab === k}" data-act="tab" data-tab="${k}">${l}</button>`).join("")}</nav>
         <div class="rscroll" data-keep-scroll="right">${S.ui.tab === "notes" ? encNotes() : S.ui.tab === "log" ? encLog() : detail(order.find(c => c.uid === S.ui.sel))}</div>
-        ${S.ui.lastRoll ? `<div class="rollbar">${S.ui.lastRoll}<button class="x" data-act="clearRoll" aria-label="Dismiss">×</button></div>` : ""}
+        ${S.ui.lastRoll ? `<div class="rollbar ${S.ui.rollSlim ? "slim" : ""}" data-act="rollExpand">${S.ui.lastRoll}<button class="x" data-act="clearRoll" aria-label="Dismiss">×</button></div>` : ""}
       </section>
     </div>
   </div>`;
@@ -594,7 +800,7 @@ function encNotes() {
     ${v ? `<p><b>${esc(v.label)}</b>${enc.partySize >= 5 ? ` · <b>5 players:</b> ${fmt(v.scaling)}` : ""}</p>` : ""}
     ${s.tactics ? `<h3>Tactics</h3><ul>${Object.entries(s.tactics).filter(([k]) => enc.combatants.some(c => c.creatureId === k)).map(([k, t]) => `<li><b>${esc(p.creatures[k].name)}:</b> ${fmt(t)}</li>`).join("")}</ul>` : ""}
     ${s.notes ? `<h3>Notes</h3><ul class="notes">${s.notes.map(n => `<li>${fmt(n)}</li>`).join("")}</ul>` : ""}
-    ${s.treasure ? `<h3>Treasure</h3><p>${fmt(s.treasure)}</p>` : ""}
+    ${lootHtml(enc.packId, s, encUnits(enc))}
     ${s.bookNote ? `<p class="booknote">${fmt(s.bookNote)}</p>` : ""}
   </div>`;
 }
@@ -608,16 +814,16 @@ function detail(c) {
   const enc = S.enc;
   const tn = S.ui.turnNotes && S.ui.turnNotes.uid === c.uid && c.uid === enc.active ? S.ui.turnNotes : null;
   let h = `<div class="pad">`;
-  if (tn) {
+  const notable = tn && (tn.notes.length > 1 || !/^<b>3 actions<\/b> this turn$/.test(tn.notes[0] || "") || (tn.prev && tn.prev.notes.length));
+  if (notable) {
     h += `<div class="turnnotes">${tn.prev && tn.prev.notes.length ? `<div class="muted small">End of ${esc(tn.prev.name)}'s turn: ${tn.prev.notes.join(" · ")}</div>` : ""}
       <div>${tn.notes.join(" · ")}</div></div>`;
   }
   h += `<div class="dhead">${colorDot(c)}<div class="dname"><h2>${esc(c.name)}</h2>${cr ? `<span class="muted">${esc(cr.kind === "hazard" ? "Hazard" : "Creature")} ${cr.level}${cr.sourceOverride === "elite adjustment" ? " · elite" : ""}</span>` : `<span class="muted">Player character</span>`}</div>
     <div class="dbtns">
       ${c.uid === enc.active && c.kind !== "hazard" ? `<button data-act="delay" data-uid="${c.uid}">Delay</button>` : ""}
-      <button data-act="rename" data-uid="${c.uid}">Rename</button>
-      ${c.kind !== "pc" ? `<button data-act="recolor" data-uid="${c.uid}">Color</button>` : ""}
-      <button class="danger" data-act="remove" data-uid="${c.uid}">Remove</button>
+      ${c.kind === "hazard" && c.hp == null ? `<button aria-pressed="${!!c.defeated}" data-act="toggleDefeated" data-uid="${c.uid}">${c.defeated ? "Disabled / done" : "Mark disabled"}</button>` : ""}
+      <button class="iconbtn sm" data-act="cMenu" data-uid="${c.uid}" aria-label="More">⋯</button>
     </div></div>`;
   // HP block
   const scD = cr ? statCalc(c, cr) : null;
@@ -633,8 +839,6 @@ function detail(c) {
         ${cr && cr.broken ? `<button aria-pressed="${!!c.broken}" data-act="toggleBroken" data-uid="${c.uid}">${c.broken ? "Armor broken" : "Armor intact"}</button>` : ""}
         <button aria-pressed="${!!c.defeated}" data-act="toggleDefeated" data-uid="${c.uid}">${c.defeated ? "Defeated" : "Mark defeated"}</button>
       </div></div>`;
-  } else if (c.kind === "hazard") {
-    h += `<div class="hpblock"><div class="hpbtns"><button aria-pressed="${!!c.defeated}" data-act="toggleDefeated" data-uid="${c.uid}">${c.defeated ? "Disabled / done" : "Mark disabled"}</button></div></div>`;
   }
   // counters
   if (c.counters && c.counters.length) h += `<div class="counters">${c.counters.map((ct, i) => counterHtml(ct.label, ct.val, ct.max, "cCounter", `data-uid="${c.uid}" data-i="${i}"`)).join("")}</div>`;
@@ -710,7 +914,7 @@ function dcFn(cr, sc) {
     return r.delta ? `<span class="adjv" title="${esc(r.parts.map(q => q.cond + " " + q.value).join(", "))}">${r.value}</span>` : String(base);
   };
 }
-function partsNote(r) { return r && r.delta ? r.parts.map(q => `${q.cond.toLowerCase()} (${String(q.value).replace("-", "−")})`).join(", ") : ""; }
+function partsNote(r) { return r && r.delta ? r.parts.map(q => `${String(q.value).replace("-", "−")} ${q.cond.toLowerCase().replace(/\s+\d+$/, "")}`).join(", ") : ""; }
 function adjBtn(label, r, extra = "") {
   return `<button class="rb ${r.delta ? "adj" : ""}" data-act="roll" data-mod="${r.value}" data-label="${esc(label)}" data-note="${esc(partsNote(r))}" ${extra}>${sgn(r.value)}</button>`;
 }
@@ -719,6 +923,19 @@ function statblock(cr, c) {
   const enc = S.enc; const p = pack(enc.packId); const sec = sectionOf(enc.packId, enc.secId);
   const sc = statCalc(c, cr); const dcf = dcFn(cr, sc);
   const F = t => fmt(t, { dcf });
+  const SN = shortName(c);
+  const refName = k => { const r = refText(k, enc.packId); return r ? r.name.toLowerCase().replace(/\s*\((trait|traits|item[^)]*)\)\s*$/, "").trim() : null; };
+  // tappable trait list: each trait that matches a ref becomes a link; returns [html, usedKeys]
+  const traitLinks = (traits, keys) => {
+    const used = new Set();
+    const html = traits.map(t => {
+      const tl = t.toLowerCase();
+      const k = (keys || []).find(k2 => { const n = refName(k2); return n && (tl === n || tl.startsWith(n) || n.split(" / ").some(x => tl.startsWith(x))); });
+      if (k) { used.add(k); return `<button class="tref" data-act="ref" data-ref="${esc(k)}">${esc(t)}</button>`; }
+      return esc(t);
+    }).join(", ");
+    return [html, used];
+  };
   const tactics = sec && sec.tactics && sec.tactics[c.creatureId];
   const allRefs = [...(cr.refs || [])];
   const atk = c.atk || { n: 0, hold: 0, holdN: null };
@@ -729,11 +946,13 @@ function statblock(cr, c) {
     const used = c.used && c.used[a.name];
     const atkAndDmg = a.rollAttack != null && a.rollDamage;
     const ra = a.rollAttack != null ? (atkAndDmg ? sc.attack({ range: a.range || "melee", traits: [] }, a.rollAttack) : sc.dc(a.rollAttack)) : null;
-    return `<div class="ability"><b>${esc(a.name)}</b> ${a.cost ? icon(a.cost) : ""}${a.traits ? ` <span class="muted">(${esc(a.traits)})</span>` : ""} ${F(a.text)}
-      ${(a.refs || []).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
-      ${atkAndDmg ? `<button class="rb atk ${ra.delta ? "adj" : ""}" data-act="roll" data-strike="1" data-uid="${c.uid}" data-ai="${ai}" data-mod="${ra.value}" data-note="${esc(partsNote(ra))}" data-label="${esc(`${c.name}: ${a.name}`)}">Attack ${sgn(ra.value)}</button>`
-        : ra ? adjBtn(`${c.name}: ${a.rollLabel || a.name}`, ra) : ""}
-      ${a.rollDamage ? `<button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-ai="${ai}" data-label="${esc(c.name + ": " + a.name)}">${esc(a.rollDamage)} ${esc(a.rollType || "")}</button>` : ""}
+    const selfRef = (a.refs || []).find(r => { const n = refName(r); return n && a.name.toLowerCase().startsWith(n); });
+    const txt = selfRef && /^See [^.]+\.$/.test(a.text) ? "" : F(a.text);
+    return `<div class="ability">${selfRef ? `<button class="tref ab" data-act="ref" data-ref="${esc(selfRef)}">${esc(a.name)}</button>` : `<b>${esc(a.name)}</b>`} ${a.cost ? icon(a.cost) : ""}${a.traits ? ` <span class="muted">(${esc(a.traits)})</span>` : ""} ${txt}
+      ${(a.refs || []).filter(r => r !== selfRef).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
+      ${atkAndDmg ? `<button class="rb atk ${ra.delta ? "adj" : ""}" data-act="roll" data-strike="1" data-uid="${c.uid}" data-ai="${ai}" data-mod="${ra.value}" data-note="${esc(partsNote(ra))}" data-label="${esc(`${SN}: ${a.name}`)}">Attack ${sgn(ra.value)}</button>`
+        : ra ? adjBtn(`${SN}: ${a.rollLabel || a.name}`, ra) : ""}
+      ${a.rollDamage ? `<button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-ai="${ai}" data-label="${esc(SN + ": " + a.name)}">${esc(a.rollDamage)} ${esc(a.rollType || "")}</button>` : ""}
       ${a.map === "hold2" ? (atk.hold ? `<span class="badge">Next ${atk.hold} Strike${atk.hold === 1 ? "" : "s"} share a penalty</span>` : `<button class="rb" data-act="mapHold" data-uid="${c.uid}">Use (next 2 Strikes share a penalty)</button>`) : ""}
       ${a.cooldown ? (cd ? `<span class="badge warnb">Recharging: ${cd} round${cd === 1 ? "" : "s"}</span> <button class="mini" data-act="cdClear" data-uid="${c.uid}" data-name="${esc(a.name)}">Reset</button>` : `<button class="rb" data-act="useCd" data-uid="${c.uid}" data-name="${esc(a.name)}" data-expr="${esc(a.cooldown)}">Use (roll ${esc(a.cooldown)})</button>`) : ""}
       ${a.frequency === "round" ? `<button class="rb" aria-pressed="${!!used}" data-act="useRound" data-uid="${c.uid}" data-name="${esc(a.name)}">${used ? "Used this round" : "Mark used"}</button>` : ""}
@@ -742,8 +961,8 @@ function statblock(cr, c) {
   let h = `<div class="sb">`;
   if (tactics) h += `<div class="tactics"><b>Tactics</b> ${F(tactics)}</div>`;
   for (const n of cr.notes || []) h += `<p class="sbnote"><i>${F(n)}</i></p>`;
-  h += `<div class="traits">${cr.rarity ? `<span class="trait rare">${esc(cr.rarity)}</span>` : ""}${cr.size ? `<span class="trait">${esc(cr.size)}</span>` : ""}${(cr.traits || []).map(t => `<span class="trait">${esc(t)}</span>`).join("")}</div>`;
-  const saveBtns = () => ["fort", "ref", "will"].filter(k => cr.saves && cr.saves[k] != null).map(k => `<b>${{ fort: "Fort", ref: "Ref", will: "Will" }[k]}</b> ${adjBtn(`${c.name}: ${{ fort: "Fortitude", ref: "Reflex", will: "Will" }[k]}`, sc.save(k, cr.saves[k]))}`).join(" ");
+  const traitLine = `<p class="traitline">${[cr.rarity, cr.size, ...(cr.traits || [])].filter(Boolean).map(esc).join(" · ")}</p>`;
+  const saveBtns = () => ["fort", "ref", "will"].filter(k => cr.saves && cr.saves[k] != null).map(k => `<b>${{ fort: "Fort", ref: "Ref", will: "Will" }[k]}</b> ${adjBtn(`${SN}: ${{ fort: "Fortitude", ref: "Reflex", will: "Will" }[k]}`, sc.save(k, cr.saves[k]))}`).join(" ");
   if (cr.kind === "hazard") {
     if (cr.routine) h += `<div class="ability"><b>Routine</b> (${cr.routine.actions} actions) ${F(cr.routine.text)}
       <button class="rb dmgroll" data-act="rollDmg" data-expr="${esc(cr.routine.damage)}" data-type="${esc(cr.routine.type)}" data-label="${esc(cr.name)} routine">${esc(cr.routine.damage)} ${esc(cr.routine.type)}</button>
@@ -755,14 +974,14 @@ function statblock(cr, c) {
     if (cr.stealthDC != null) h += `<p><b>Stealth DC</b> ${cr.stealthDC} ${cr.stealthNote ? F("(" + cr.stealthNote + ")") : ""}</p>`;
     else if (cr.stealth != null) h += `<p><b>Stealth</b> ${adjBtn(`${cr.name}: Stealth`, sc.skill("Stealth", cr.stealth))} ${cr.stealthNote ? F("(" + cr.stealthNote + ")") : ""}</p>`;
     if (cr.description) h += `<p><b>Description</b> ${F(cr.description)}</p>`;
+    h += traitLine;
   } else {
     h += ab("top");
     if (cr.conditional && cr.conditional.length) {
       h += `<div class="condtoggles">${cr.conditional.map(x => {
         const on = !!(c.toggles || {})[x.id];
         return `<span class="ctog"><button class="togchip" aria-pressed="${on}" data-act="toggleCond" data-hold="toggleCondAll" data-uid="${c.uid}" data-id="${esc(x.id)}">
-          <span class="tl">${on ? "✓ " : ""}${esc(x.label)}</span><span class="ts">+${esc(x.dice)} ${x.type === "same" ? "damage" : esc(x.type)} · ${x.applies === "all" ? "all attacks" : x.applies + " attacks"}</span>${S.settings.tipHold ? "" : `<span class="th">hold = all</span>`}</button>
-          <button class="mini allbtn" data-act="toggleCondAll" data-uid="${c.uid}" data-id="${esc(x.id)}">All ${esc(cr.name)}</button></span>`;
+          <span class="tl">${on ? "✓ " : ""}${esc(x.label)}</span><span class="ts">+${esc(x.dice)} ${x.type === "same" ? "damage" : esc(x.type)} · ${x.applies === "all" ? "all attacks" : x.applies + " attacks"}</span>${S.settings.tipHold ? "" : `<span class="th">hold = all</span>`}</button></span>`;
       }).join("")}</div>`;
     }
     h += `<p><b>Speed</b> ${esc(cr.speed)}</p>`;
@@ -771,30 +990,86 @@ function statblock(cr, c) {
       const agile = (s.traits || []).includes("agile");
       const extras = activeConds(c, cr, s.range);
       const ar = sc.attack(s, s.bonus);
-      h += `<div class="strike"><div><b>${s.range === "melee" ? "Melee" : "Ranged"}</b> ${icon(s.cost || "1")} ${esc(s.name)}
-          ${s.traits && s.traits.length ? `<span class="muted">(${s.traits.map(t => esc(t)).join(", ")})</span>` : ""}
+      const [tl, used] = traitLinks(s.traits || [], s.refs);
+      const nameRef = (s.refs || []).find(k => !used.has(k) && refName(k) && s.name.toLowerCase().startsWith(refName(k)));
+      if (nameRef) used.add(nameRef);
+      const leftover = (s.refs || []).filter(k => !used.has(k));
+      h += `<div class="strike"><div><b>${s.range === "melee" ? "Melee" : "Ranged"}</b> ${icon(s.cost || "1")} ${nameRef ? `<button class="tref" data-act="ref" data-ref="${esc(nameRef)}">${esc(s.name)}</button>` : esc(s.name)}
+          ${s.traits && s.traits.length ? `<span class="muted">(${tl})</span>` : ""}
           <span class="dmgtxt">${esc(s.damage)} ${esc(s.type)}${extras.map(x => ` <b class="plus">+ ${esc(x.dice)} ${x.type === "same" ? "" : esc(x.type)} (${esc(x.label)})</b>`).join("")}${s.extra ? ` ${F(s.extra)}` : ""}</span></div>
         <div class="strike-rolls">
-          ${[1, 2, 3].map(n => { const m = ar.value + mapPenalty(n, agile); return `<button class="rb atk ${ar.delta ? "adj" : ""} ${n === nextN ? "next" : ""}" data-act="roll" data-strike="1" data-n="${n}" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-note="${esc(partsNote(ar))}" data-label="${esc(`${c.name}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
-          <button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name)}">Damage</button>
-          <button class="rb dmgroll" data-act="rollDmg" data-crit="1" data-uid="${c.uid}" data-si="${si}" data-label="${esc(c.name + ": " + s.name + " (critical)")}">Crit</button>
-          ${(s.refs || []).map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
+          ${[1, 2, 3].map(n => { const m = ar.value + mapPenalty(n, agile); return `<button class="rb atk ${ar.delta ? "adj" : ""} ${n === nextN ? "next" : ""}" data-act="roll" data-strike="1" data-n="${n}" data-uid="${c.uid}" data-si="${si}" data-mod="${m}" data-note="${esc(partsNote(ar))}" data-label="${esc(`${SN}: ${s.name} (${["1st", "2nd", "3rd"][n - 1]})`)}">${["1st", "2nd", "3rd"][n - 1]} ${sgn(m)}</button>`; }).join("")}
+          <button class="rb dmgroll" data-act="rollDmg" data-uid="${c.uid}" data-si="${si}" data-label="${esc(SN + ": " + s.name)}">Damage</button>
+          <button class="rb dmgroll" data-act="rollDmg" data-crit="1" data-uid="${c.uid}" data-si="${si}" data-label="${esc(SN + ": " + s.name + " (critical)")}">Crit</button>
+          ${leftover.map(r => refText(r, enc.packId) ? `<button class="chip" data-act="ref" data-ref="${esc(r)}">${esc(refText(r, enc.packId).name)}</button>` : "").join("")}
         </div></div>`;
     });
     h += ab("bottom");
     h += `<hr><p><b>AC</b> ${adjNum(sc.ac(currentAC(cr, c)))}${cr.acNote ? ` <span class="muted">(${esc(cr.acNote)})</span>` : ""}; ${saveBtns()}</p>`;
     h += `<p><b>HP</b> ${cr.hp}${cr.fastHealing ? `, fast healing ${cr.fastHealing}` : ""}${cr.voidHealing ? ", void healing" : ""}${cr.hardness ? `; <b>Hardness</b> ${cr.hardness}` : ""}${cr.immunities && cr.immunities.length ? `; <b>Immunities</b> ${esc(cr.immunities.join(", "))}` : ""}${cr.weaknesses && cr.weaknesses.length ? `; <b>Weaknesses</b> ${esc(cr.weaknesses.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}${cr.resistances && cr.resistances.length ? `; <b>Resistances</b> ${esc(cr.resistances.map(w => `${w.type} ${w.value}`).join(", "))}` : ""}</p>`;
     h += ab("mid");
-    h += `<hr><p><b>Perception</b> ${adjBtn(`${c.name}: Perception`, sc.perception(cr.perception))}${cr.senses ? `; ${esc(cr.senses)}` : ""}</p>`;
+    h += `<hr><p><b>Perception</b> ${adjBtn(`${SN}: Perception`, sc.perception(cr.perception))}${cr.senses ? `; ${esc(cr.senses)}` : ""}</p>`;
     if (cr.languages) h += `<p><b>Languages</b> ${esc(cr.languages)}</p>`;
-    if (cr.skills && cr.skills.length) h += `<p><b>Skills</b> ${cr.skills.map(s => `${esc(s.name)} ${adjBtn(`${c.name}: ${s.name}`, sc.skill(s.name, s.mod))}`).join(" ")}</p>`;
+    if (cr.skills && cr.skills.length) h += `<p><b>Skills</b> ${cr.skills.map(s => `${esc(s.name)} ${adjBtn(`${SN}: ${s.name}`, sc.skill(s.name, s.mod))}`).join(" ")}</p>`;
     if (cr.attrs) h += `<p class="attrs">${["str", "dex", "con", "int", "wis", "cha"].map(k => `<span><b>${k[0].toUpperCase() + k.slice(1)}</b> ${sgn(cr.attrs[k])}</span>`).join("")}</p>`;
     if (cr.items) h += `<p><b>Items</b> ${F(cr.items)}</p>`;
+    h += traitLine;
   }
   const rc = refChips(allRefs, enc.packId);
   if (rc) h += `<details class="rulesbox"><summary>Rules ▸</summary>${rc}</details>`;
   h += `<p class="muted small src">${esc(cr.source || "")}${cr.sourceOverride ? ` · ${esc(cr.sourceOverride)}` : ""}${p.lookupsAsOf ? ` · rules checked ${esc(p.lookupsAsOf)}` : ""}</p>`;
   return h + `</div>`;
+}
+
+/* --------------------------------------------------------------- loot */
+// Split a stat block's Items line on commas that aren't inside parentheses.
+function splitItems(t) {
+  const out = []; let depth = 0, cur = "";
+  for (const ch of String(t || "")) {
+    if (ch === "(") depth++; else if (ch === ")") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) { if (cur.trim()) out.push(cur.trim()); cur = ""; } else cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+function lootMode(packId, sec) {
+  if (!sec.lootModes || !sec.lootModes.length) return null;
+  const st = secState(packId, sec);
+  return sec.lootModes.find(m => m.id === st.lootMode) || sec.lootModes[0];
+}
+// units: [{ creatureId, name, defeated }]. Returns html ("" when there's nothing to list).
+function lootHtml(packId, sec, units, { preview = false } = {}) {
+  const p = pack(packId); if (!p || !sec) return "";
+  const mode = lootMode(packId, sec);
+  const carriers = units.filter(u => p.creatures[u.creatureId] && p.creatures[u.creatureId].items);
+  if (!carriers.length && !sec.treasure) return "";
+  const counted = carriers.filter(u => preview || u.defeated || (mode && mode.countAll));
+  const standing = carriers.filter(u => !counted.includes(u));
+  // group by creature type so "one set" limits apply per type, then merge identical items across types
+  const sets = {};
+  for (const u of counted) sets[u.creatureId] = (sets[u.creatureId] || 0) + 1;
+  const items = new Map();
+  for (const [cid, n0] of Object.entries(sets)) {
+    const n = mode && mode.maxSets ? Math.min(n0, mode.maxSets) : n0;
+    for (const it of splitItems(p.creatures[cid].items)) items.set(it, (items.get(it) || 0) + n);
+  }
+  const list = [...items.entries()].map(([it, n]) => `<li>${n > 1 ? `<b>${n}×</b> ` : ""}${fmt(it, { link: false })}</li>`).join("");
+  let h = `<div class="loot"><h3>Loot</h3>`;
+  if (sec.lootModes && carriers.length) h += `<div class="seg small">${sec.lootModes.map(m => `<button aria-pressed="${m.id === mode.id}" data-act="lootMode" data-pack="${esc(packId)}" data-sec="${esc(sec.id)}" data-id="${esc(m.id)}">${esc(m.label)}</button>`).join("")}</div>${mode.note ? `<p class="muted small">${fmt(mode.note)}</p>` : ""}`;
+  if (carriers.length) {
+    const head = preview ? `Carried by these enemies` : mode && mode.countAll ? `Handed over (${counted.length})` : `From defeated enemies (${counted.length} of ${carriers.length})`;
+    h += `<h4>${head}</h4>${list ? `<ul class="lootlist">${list}</ul>` : `<p class="muted small">Nothing yet. Items appear here as enemies are defeated.</p>`}`;
+    if (!preview && standing.length) {
+      const by = {}; for (const u of standing) { const cr = p.creatures[u.creatureId]; const nm = cr.short || cr.name; by[nm] = (by[nm] || 0) + 1; }
+      h += `<p class="muted small"><b>Still standing:</b> ${Object.entries(by).map(([nm, k]) => `${k}× ${esc(nm)}`).join(", ")}</p>`;
+    }
+    h += `<p class="muted small">Ammo and batteries as carried at the start of the fight. No prices in the stat blocks.</p>`;
+  }
+  if (sec.treasure) h += `<h4>Found here</h4><p>${fmt(sec.treasure)}</p>`;
+  return h + `</div>`;
+}
+function encUnits(enc) {
+  return enc.combatants.filter(c => c.creatureId).map(c => ({ creatureId: c.creatureId, name: c.name, defeated: !!c.defeated || (c.hp != null && c.hp <= 0) }));
 }
 
 /* ------------------------------------------------------------- modals */
@@ -811,10 +1086,14 @@ function renderModal() {
   else if (m.type === "prompt") inner = modalPrompt(m);
   else if (m.type === "add") inner = modalAdd(m);
   else if (m.type === "pen") inner = modalPen(m);
+  else if (m.type === "cmenu") { const c = findC(m.uid); inner = `<h3>${esc(c.name)}</h3><div class="menu">
+      <button data-act="rename" data-uid="${c.uid}">Rename</button>
+      ${c.kind === "monster" ? `<button data-act="recolor" data-uid="${c.uid}">Change mini color</button>` : ""}
+      <button class="danger" data-act="remove" data-uid="${c.uid}">Remove from encounter</button></div><div class="row end"><button data-act="closeModal">Close</button></div>`; }
   else if (m.type === "setupAdd") { const p = pack(S.setup.packId); inner = `<h3>Add to this encounter</h3><div class="addlist">${Object.entries(p.creatures).map(([id, cr]) => `<button data-act="setupAddPick" data-id="${esc(id)}">${esc(cr.name)} <span class="muted">${cr.kind === "hazard" ? "Hazard" : "Creature"} ${cr.level}</span></button>`).join("")}</div><div class="row end"><button data-act="closeModal">Close</button></div>`; }
-  else if (m.type === "confirm") inner = `<h3>${esc(m.title)}</h3><p>${m.text || ""}</p><div class="row end"><button data-act="closeModal">Cancel</button><button class="primary ${m.danger ? "danger-bg" : ""}" data-act="confirmYes">${esc(m.yes || "OK")}</button></div>`;
+  else if (m.type === "confirm") inner = `<h3>${esc(m.title)}</h3><p>${typeof m.text === "function" ? m.text() : m.text || ""}</p><div class="row end"><button data-act="closeModal">Cancel</button><button class="primary ${m.danger ? "danger-bg" : ""}" data-act="confirmYes">${esc(m.yes || "OK")}</button></div>`;
   else if (m.type === "colors") inner = `<h3>Mini color</h3><div class="swatchgrid">${S.settings.palette.map((p, i) => `<button class="swatch" style="background:${p.c};color:${textOn(p.c)}" data-act="pickColor" data-i="${i}">${esc(p.n)}</button>`).join("")}<button class="swatch" data-act="pickColor" data-i="-1">None</button></div>`;
-  el.innerHTML = `<div class="scrim" data-act="closeModal"></div><div class="sheet ${m.type === "pad" ? "wide" : ""}" role="dialog">${inner}</div>`;
+  el.innerHTML = `<div class="scrim" data-act="closeModal"></div><div class="sheet ${m.type === "pad" || m.wide ? "wide" : ""}" role="dialog">${inner}</div>`;
   el.classList.add("on");
 }
 function modalRef(m) {
@@ -1022,8 +1301,9 @@ function viewSettings() {
 
 /* ============================================================ actions */
 function findC(uid) { return S.enc && S.enc.combatants.find(c => c.uid === uid); }
-function showRoll(html, log) { S.ui.lastRoll = html; if (log) logLine(log); saveEnc(); render(); }
+function showRoll(html, log) { S.ui.lastRoll = html; S.ui.rollSlim = false; if (log) logLine(log); saveEnc(); render(); }
 const A = {
+  ...INF_ACTIONS,
   go: el => go(el.dataset.href),
   closeModal: () => closeModal(),
   ref: el => openModal({ type: "ref", ref: el.dataset.ref }),
@@ -1047,7 +1327,12 @@ const A = {
     S.setup = buildSetup(el.dataset.pack, el.dataset.sec, el.dataset.variant); go("#setup");
   },
   confirmYes: () => { const m = S.ui.modal; S.ui.modal = null; if (m && m.then) m.then(); else render(); },
-  setupVariant: el => { S.setup = buildSetup(S.setup.packId, S.setup.secId, el.dataset.id); render(); },
+  setupVariant: el => { S.setup = buildSetup(S.setup.packId, S.setup.secId, el.dataset.id); const sc = sectionOf(S.setup.packId, S.setup.secId); secState(S.setup.packId, sc).variant = el.dataset.id; saveSec(S.setup.packId, S.setup.secId); render(); },
+  quickSetup: el => {
+    const s = sectionOf(el.dataset.pack, el.dataset.sec); const st = secState(el.dataset.pack, s);
+    const v = (s.variants.find(x => x.id === st.variant) || s.variants[0]).id;
+    A.newSetup({ dataset: { pack: el.dataset.pack, sec: el.dataset.sec, variant: v } });
+  },
   rollInit: el => { const r = S.setup.rows.find(x => x.uid === el.dataset.uid); r.init = d20(r.initMod).total; render(); },
   rollAllInit: () => { const p = pack(S.setup.packId); for (const r of S.setup.rows) if (!p.creatures[r.creatureId].simple) r.init = d20(r.initMod).total; render(); },
   cycleColor: el => {
@@ -1061,8 +1346,19 @@ const A = {
   prevTurn: () => nextTurn(-1),
   undo: () => { if (!S.undo.length) return; S.enc = JSON.parse(S.undo.pop()); S.ui.turnNotes = null; saveEnc(); toast("Undone"); render(); },
   menu: () => openModal({ type: "menu" }),
-  endEnc: () => openModal({ type: "confirm", title: "End this encounter?", text: "The fight and its log are cleared from the tablet.", yes: "End encounter", danger: true, then: () => { const back = `#section/${encodeURIComponent(S.enc.packId)}/${encodeURIComponent(S.enc.secId)}`; S.enc = null; S.undo = []; kv.del("enc"); kv.del("undo"); go(back); } }),
-  clearRoll: () => { S.ui.lastRoll = null; render(); },
+  endEnc: () => {
+    const enc = S.enc; const sec = sectionOf(enc.packId, enc.secId);
+    const hasLoot = !!lootHtml(enc.packId, sec, encUnits(enc));
+    openModal({ type: "confirm", wide: hasLoot, title: "End this encounter?", text: () => { const loot = lootHtml(enc.packId, sec, encUnits(enc)); return `The fight and its log are cleared from the tablet.${loot ? ` Note the loot first:</p>${loot}<p>` : ""}`; }, yes: "End encounter", danger: true, then: () => {
+      const k = secKey(enc.packId, enc.secId);
+      S.hist[k] = { at: Date.now(), damaged: [...new Set(enc.combatants.filter(c => c.creatureId && c.maxHp != null && (c.hp < c.maxHp || c.defeated)).map(c => c.creatureId))] };
+      kv.set("hist:" + k, S.hist[k]);
+      const back = `#pack/${encodeURIComponent(enc.packId)}`; S.enc = null; S.undo = []; kv.del("enc"); kv.del("undo"); go(back);
+    } });
+  },
+  lootMode: el => { const sec = sectionOf(el.dataset.pack, el.dataset.sec); secState(el.dataset.pack, sec).lootMode = el.dataset.id; saveSec(el.dataset.pack, el.dataset.sec); render(); },
+  clearRoll: (el, ev) => { if (ev) ev.stopPropagation(); S.ui.lastRoll = null; render(); },
+  rollExpand: () => { if (S.ui.rollSlim) { S.ui.rollSlim = false; const rb = document.querySelector(".rollbar"); if (rb) rb.classList.remove("slim"); } },
   roll: el => {
     const mod = Number(el.dataset.mod); const r = d20(mod);
     if (el.dataset.strike && el.dataset.uid && S.enc) {
@@ -1076,12 +1372,12 @@ const A = {
       }
     }
     const flag = r.nat === 20 ? ' <span class="nat20">NAT 20</span>' : r.nat === 1 ? ' <span class="nat1">NAT 1</span>' : "";
-    let txt = `${esc(el.dataset.label)}: <span class="die">${r.nat}</span> ${sgn(mod)} = <b class="rtotal">${r.total}</b>${flag}${el.dataset.note ? ` <small class="incl">includes ${esc(el.dataset.note)}</small>` : ""}`;
+    let txt = `<div class="rl1">${esc(el.dataset.label)}: <span class="die">${r.nat}</span> ${sgn(mod)} = <b class="rtotal">${r.total}</b>${flag}${el.dataset.note ? ` <small class="incl">(${esc(el.dataset.note)})</small>` : ""}</div>`;
     if (el.dataset.strike && el.dataset.uid) {
       const c = findC(el.dataset.uid); const cr = c && crOf(c); const s = c && strikeOf(c, el);
       if (s && s.damage) {
         const hit = damageLine(c, cr, s, false), crit = damageLine(c, cr, s, true);
-        txt += `<div class="dmgpair"><div><span>Hit <b>${hit.total}</b></span><small>${esc(hit.calc)}</small></div><div><span>Crit <b>${crit.total}</b>${S.settings.critMode === "dice" ? " <em>dice doubled</em>" : " <em>total × 2</em>"}</span><small>${esc(crit.calc)}</small></div></div>`;
+        txt += `<div class="dmgpair"><div><span>Hit <b>${hit.total}</b></span><small class="calc">${esc(hit.calc)}</small></div><div><span>Crit <b>${crit.total}</b></span><small class="calc">${S.settings.critMode === "dice" ? "dice doubled · " : "× 2 · "}${esc(crit.calc)}</small></div></div>`;
       }
     }
     showRoll(txt, txt.replace(/<\/div><div>/g, " · ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " "));
@@ -1101,6 +1397,7 @@ const A = {
   },
   mapHold: el => mutate(() => { const c = findC(el.dataset.uid); c.atk = c.atk || { n: 0, hold: 0, holdN: null }; c.atk.hold = 2; c.atk.holdN = null; }),
   penBreak: el => openModal({ type: "pen", uid: el.dataset.uid }),
+  cMenu: el => openModal({ type: "cmenu", uid: el.dataset.uid }),
   toggleCond: el => {
     const c = findC(el.dataset.uid); const cr = crOf(c); const x = cr.conditional.find(y => y.id === el.dataset.id);
     mutate(() => { c.toggles = c.toggles || {}; c.toggles[x.id] = !c.toggles[x.id]; });
@@ -1271,7 +1568,7 @@ const I = {
       if (p.format !== "encounter-runner-pack" || !p.id || !Array.isArray(p.sections) || !p.creatures) throw new Error("This isn't an Encounter Runner pack.");
       const newer = (a, b) => { const x = String(a).split(".").map(Number), y = String(b).split(".").map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); } return false; };
       await packStore.put(p); S.packs[p.id] = p;
-      toast(p.minAppVersion && newer(p.minAppVersion, APP_VERSION) ? `Imported ${esc(p.chapter)}, but it needs app version ${esc(p.minAppVersion)} — reload the app while online to update.` : `Imported ${esc(p.chapter)}`, 6000); render();
+      toast(p.minAppVersion && newer(p.minAppVersion, APP_VERSION) ? `Imported ${esc(p.chapter)}, but it needs app version ${esc(p.minAppVersion)} — reload the app while online to update.` : `Imported ${esc(p.chapter)}`, p.minAppVersion && newer(p.minAppVersion, APP_VERSION) ? 6000 : 3000); render();
     } catch (e) { toast("Import failed: " + esc(e.message), 5000); }
     el.value = "";
   },
@@ -1308,7 +1605,18 @@ const I = {
   palN: el => { S.settings.palette[+el.dataset.i].n = el.value; saveSettings(); },
 };
 
+// Remember which <details> were open so a re-render doesn't collapse them.
+document.addEventListener("toggle", ev => { const d = ev.target; if (d && d.dataset && d.dataset.keepOpen) { S.ui.open = S.ui.open || {}; S.ui.open[d.dataset.keepOpen] = d.open; } }, true);
+const isOpen = k => !!(S.ui.open && S.ui.open[k]);
+document.addEventListener("scroll", ev => {
+  if (S.ui.lastRoll && !S.ui.rollSlim && Date.now() > (S.ui.scrollQuietUntil || 0) && ev.target && ev.target.classList && ev.target.classList.contains("rscroll")) {
+    S.ui.rollSlim = true; const rb = document.querySelector(".rollbar"); if (rb) rb.classList.add("slim");
+  }
+}, true);
 document.addEventListener("click", ev => {
+  if (S.ui.lastRoll && !S.ui.rollSlim && !ev.target.closest(".rollbar") && !ev.target.closest('[data-act="roll"],[data-act="rollDmg"],[data-act="useCd"]')) {
+    S.ui.rollSlim = true; const rb = document.querySelector(".rollbar"); if (rb) rb.classList.add("slim");
+  }
   if (Date.now() < hold.suppressUntil) { hold.suppressUntil = 0; ev.preventDefault(); ev.stopPropagation(); return; }
   if (Date.now() - dragEndAt < 300) return;
   const el = ev.target.closest("[data-act]"); if (!el) return;
@@ -1412,7 +1720,7 @@ async function boot() {
     S.enc = (await kv.get("enc")) || null;
     S.undo = (await kv.get("undo")) || [];
     const all = await kv.all();
-    for (const [k, v] of Object.entries(all)) if (k.startsWith("sec:")) S.secState[k.slice(4)] = v;
+    for (const [k, v] of Object.entries(all)) { if (k.startsWith("sec:")) S.secState[k.slice(4)] = v; else if (k.startsWith("hist:")) S.hist[k.slice(5)] = v; }
   } catch (e) { console.error(e); toast("Couldn't open storage on this device: " + esc(e.message), 6000); }
   applyTheme();
   S.persisted = await requestPersist();
